@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "^use_skill$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .bob/assets/tools/log-skill.js",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

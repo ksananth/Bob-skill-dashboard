@@ -1,0 +1,58 @@
+{
+  "accessibility-audit": {
+    "count": 0,
+    "lastUsed": null
+  },
+  "compose-screen": {
+    "count": 0,
+    "lastUsed": null
+  },
+  "compose-ui-test": {
+    "count": 0,
+    "lastUsed": null
+  },
+  "crash-log-triage": {
+    "count": 0,
+    "lastUsed": null
+  },
+  "design-system-component": {
+    "count": 0,
+    "lastUsed": null
+  },
+  "figma-to-compose": {
+    "count": 0,
+    "lastUsed": null
+  },
+  "gradle-dependency-update": {
+    "count": 0,
+    "lastUsed": null
+  },
+  "kmp-shared-module": {
+    "count": 0,
+    "lastUsed": null
+  },
+  "kotlin-code-review": {
+    "count": 0,
+    "lastUsed": null
+  },
+  "nav3-migration": {
+    "count": 0,
+    "lastUsed": null
+  },
+  "pr-description": {
+    "count": 0,
+    "lastUsed": null
+  },
+  "proguard-rules": {
+    "count": 0,
+    "lastUsed": null
+  },
+  "release-notes": {
+    "count": 0,
+    "lastUsed": null
+  },
+  "viewmodel-unit-test": {
+    "count": 0,
+    "lastUsed": null
+  }
+}
