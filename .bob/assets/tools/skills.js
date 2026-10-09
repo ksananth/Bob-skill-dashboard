@@ -1,15 +1,18 @@
 #!/usr/bin/env node
-// Bob skills — one script, two jobs (both run by the hooks in .bob/settings.json).
+// Bob skills — one script, run by the hooks in .bob/settings.json.
 //
 //   node .bob/assets/tools/skills.js log     After each use_skill: adds 1 to that skill in skills-usage.json, then builds.
-//   node .bob/assets/tools/skills.js build   On session start (or by hand): writes assets/data/skills-data.js.
+//   node .bob/assets/tools/skills.js start   On session start: builds, and starts the watcher in the background if needed.
+//   node .bob/assets/tools/skills.js build   Rebuilds assets/data/skills-data.js now (also run on every prompt).
+//   node .bob/assets/tools/skills.js watch   Watches skills/ and skills-usage.json and rebuilds on any change.
 //
-// skills-usage.json  ->  { "<skill-name>": <count> }   the counts (edit or set to {} to reset, then run build)
+// skills-usage.json  ->  { "<skill-name>": <count> }   the counts (edit or set to {} to reset)
 // skills-data.js     ->  the same counts + each SKILL.md, as a script, because browsers won't let a
-//                        double-clicked index.html read .json files but will load .js files.
+//                        double-clicked index.html read .json files or list folders, but will load .js files.
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { spawn } = require("child_process");
 
 const BOB = path.resolve(__dirname, "..", "..");                     // the .bob folder
 // Where skills can live (first match of a name wins, like Bob: project skills override global ones).
@@ -21,6 +24,7 @@ const SKILL_DIRS = [...new Set([
 ])];
 const USAGE_FILE = path.join(BOB, "assets", "data", "skills-usage.json");
 const DATA_FILE = path.join(BOB, "assets", "data", "skills-data.js");
+const PID_FILE = path.join(BOB, "assets", "data", "watcher.pid");
 
 /* ---------- skills ---------- */
 function frontmatter(text) {
@@ -102,19 +106,58 @@ function log() {
 
 /* ---------- build ---------- */
 function build() {
+  // Write only when something changed, so the watcher doesn't react to its own output.
   let usage = {};
   try { usage = JSON.parse(fs.readFileSync(USAGE_FILE, "utf8")) || {}; } catch {}
   const skills = listSkills().map((s) => ({ ...s, count: Number(usage[s.id]) || 0 }));
-  fs.writeFileSync(DATA_FILE, "// Generated from skills-usage.json and the SKILL.md files by skills.js - do not edit\n" +
-    "window.BOB_SKILLS = " + JSON.stringify(skills) + ";\n");
+  const out = "// Generated from skills-usage.json and the SKILL.md files by skills.js - do not edit\n" +
+    "window.BOB_SKILLS = " + JSON.stringify(skills) + ";\n";
+  let old = "";
+  try { old = fs.readFileSync(DATA_FILE, "utf8"); } catch {}
+  if (out !== old) fs.writeFileSync(DATA_FILE, out);
+  return skills.length;
+}
+
+/* ---------- watch (keeps skills-data.js live) ---------- */
+function watcherRunning() {
+  try { process.kill(Number(fs.readFileSync(PID_FILE, "utf8")), 0); return true; } catch { return false; }
+}
+
+function watch() {
+  fs.writeFileSync(PID_FILE, String(process.pid));
+  const cleanup = () => { try { if (fs.readFileSync(PID_FILE, "utf8") === String(process.pid)) fs.unlinkSync(PID_FILE); } catch {} process.exit(0); };
+  process.on("SIGINT", cleanup); process.on("SIGTERM", cleanup);
+
+  let timer = null;
+  const rebuild = () => { clearTimeout(timer); timer = setTimeout(() => { try { build(); } catch {} }, 300); };
+  const watched = new Map();
+  const watchDir = (dir) => {
+    if (watched.has(dir) || !fs.existsSync(dir)) return;
+    try {
+      const w = fs.watch(dir, { recursive: true }, rebuild);       // recursive: Windows, macOS, Node 20+ on Linux
+      w.on("error", () => { watched.delete(dir); });
+      watched.set(dir, w);
+    } catch {}
+  };
+  const watchAll = () => { SKILL_DIRS.forEach(watchDir); watchDir(path.dirname(USAGE_FILE)); };
+  watchAll();
+  setInterval(() => { watchAll(); rebuild(); }, 30000);             // pick up a skills/ folder created later; safety rebuild
+  build();
+  if (process.stdout.isTTY) console.log("Watching skills for changes (Ctrl+C to stop)");
+}
+
+function start() {
+  build();
+  if (!watcherRunning()) {
+    spawn(process.execPath, [__filename, "watch"], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+  }
 }
 
 const cmd = process.argv[2];
 if (cmd === "log") log();
+else if (cmd === "start") start();
+else if (cmd === "watch") watch();
 else {
-  build();
-  if (process.stdout.isTTY) {
-    const n = listSkills().length;
-    console.log(n ? `Found ${n} skills -> assets/data/skills-data.js` : "No skills found. Looked in:\n  " + SKILL_DIRS.join("\n  "));
-  }
+  const n = build();
+  if (process.stdout.isTTY) console.log(n ? `Found ${n} skills -> assets/data/skills-data.js` : "No skills found. Looked in:\n  " + SKILL_DIRS.join("\n  "));
 }

@@ -83,9 +83,10 @@
         </div>
 
         <details class="help">
-          <summary>How the counts work</summary>
-          <p>Each time Bob activates a skill, the hook in <code>.bob/settings.json</code> adds 1 to that skill in <code>assets/data/skills-usage.json</code> and refreshes <code>assets/data/skills-data.js</code>, which this page loads. The page checks for new counts every few seconds.</p>
-          <p>To reset, set <code>skills-usage.json</code> to <code>{}</code> and run <code>node .bob/assets/tools/skills.js build</code>.</p>
+          <summary>How it updates</summary>
+          <p>Each time Bob activates a skill, the hook in <code>.bob/settings.json</code> adds 1 to that skill in <code>assets/data/skills-usage.json</code>.</p>
+          <p>A small watcher (started when a Bob session begins) rebuilds <code>assets/data/skills-data.js</code> whenever a skill is added, edited or removed in <code>skills/</code>, or the counts change. This page re-reads it every few seconds.</p>
+          <p>Not updating? Run <code>node .bob/assets/tools/skills.js watch</code>. To reset counts, set <code>skills-usage.json</code> to <code>{}</code>.</p>
         </details>
       </main>
     </div>

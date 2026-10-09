@@ -5,6 +5,17 @@
         "hooks": [
           {
             "type": "command",
+            "command": "node .bob/assets/tools/skills.js start",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "node .bob/assets/tools/skills.js build",
             "timeout": 5
           }
