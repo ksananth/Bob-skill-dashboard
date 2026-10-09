@@ -229,7 +229,7 @@
       (note ? `<span class="note">${esc(note)}</span><br>` : "") +
       (kind === "reconnect"
         ? "Allow the page to read <code>.bob</code> again to load <code>skills-usage.json</code> and <code>skill-events.json</code>."
-        : "Pick your project's <code>.bob</code> folder once. The page remembers it and reads <code>skills-usage.json</code> and <code>skill-events.json</code> live.") +
+        : "The skills viewer isn't running (Bob starts it automatically when a session begins). Start it with <code>node .bob/assets/tools/serve.js</code>, or pick your <code>.bob</code> folder once and the page will remember it.") +
       `<br><button class="primary" id="connectBtn">${kind === "reconnect" ? "Connect to .bob" : "Choose .bob folder"}</button>`;
     $("connectBtn").onclick = kind === "reconnect" ? reconnect : pickFolder;
   }
@@ -263,8 +263,25 @@
     showConnect("reconnect");
   }
 
+  // When index.html is double-clicked, look for the viewer (started by Bob's SessionStart hook) and switch to it,
+  // so the JSON files load without picking a folder.
+  const VIEWER = "http://localhost:4173";
+  async function viewerRunning() {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 900);
+      const r = await fetch(VIEWER + "/api/ping", { cache: "no-store", signal: ctrl.signal });
+      clearTimeout(t);
+      return r.ok && (await r.json()).app === "bob-skills";
+    } catch { return false; }
+  }
+
   async function start() {
-    if (location.protocol === "file:") return startFromDisk();
+    if (location.protocol === "file:") {
+      $("source").textContent = "Looking for the skills viewer…";
+      if (await viewerRunning()) { location.replace(VIEWER + "/" + location.hash); return; }
+      return startFromDisk();
+    }
     try {
       await loadFromServer();
       setInterval(() => { if (mode === "server" && !document.hidden) loadFromServer({ quiet: true }).catch(() => {}); }, POLL_MS);

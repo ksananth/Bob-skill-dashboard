@@ -2,18 +2,21 @@
 // Local viewer for the Bob skills page.
 //   node .bob/assets/tools/serve.js            -> http://localhost:4173 (opens your browser)
 //   node .bob/assets/tools/serve.js --port 5000 --no-open
+//   node .bob/assets/tools/serve.js --ensure     -> start in the background if not already running, then exit
+//                                                  (used by the SessionStart hook in .bob/settings.json; prints nothing)
 // Serves the .bob folder read-only, plus GET /api/skills = [{ id, text }] for each skills/<id>/SKILL.md.
 // The page reads assets/data/skills-usage.json and assets/data/skill-events.json directly.
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
-const { exec } = require("child_process");
+const { exec, spawn } = require("child_process");
 
 const ROOT = path.resolve(__dirname, "..", "..");      // .bob
 const SKILLS_DIR = path.join(ROOT, "skills");
 const args = process.argv.slice(2);
 const PORT = Number(args[args.indexOf("--port") + 1]) || Number(process.env.PORT) || 4173;
 const OPEN = !args.includes("--no-open");
+const ENSURE = args.includes("--ensure");
 
 const TYPES = {
   ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
@@ -42,6 +45,11 @@ const server = http.createServer((req, res) => {
   let urlPath;
   try { urlPath = decodeURIComponent(new URL(req.url, "http://x").pathname); } catch { return send(res, 400, "Bad request"); }
 
+  if (urlPath === "/api/ping") {
+    // Lets a double-clicked index.html (file://) detect the viewer and switch to it.
+    res.writeHead(200, { "Content-Type": TYPES[".json"], "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" });
+    return res.end(JSON.stringify({ ok: true, app: "bob-skills", root: ROOT }));
+  }
   if (urlPath === "/api/skills") return send(res, 200, JSON.stringify(listSkills()), TYPES[".json"]);
   if (urlPath === "/") urlPath = "/index.html";
 
@@ -56,17 +64,38 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.on("error", (e) => {
-  if (e.code === "EADDRINUSE") console.error(`Port ${PORT} is busy. Try: node .bob/assets/tools/serve.js --port ${PORT + 1}`);
-  else console.error(e.message);
-  process.exit(1);
-});
+function ping(cb) {
+  const req = http.get({ host: "127.0.0.1", port: PORT, path: "/api/ping", timeout: 800 }, (res) => {
+    let body = ""; res.on("data", (c) => (body += c));
+    res.on("end", () => { try { cb(JSON.parse(body).app === "bob-skills"); } catch { cb(false); } });
+  });
+  req.on("timeout", () => { req.destroy(); cb(false); });
+  req.on("error", () => cb(false));
+}
 
-server.listen(PORT, "127.0.0.1", () => {
-  const url = `http://localhost:${PORT}`;
-  console.log(`Bob skills: ${url}   (Ctrl+C to stop)`);
-  if (OPEN) {
-    const cmd = process.platform === "win32" ? `start "" "${url}"` : process.platform === "darwin" ? `open "${url}"` : `xdg-open "${url}"`;
-    exec(cmd, () => {});
-  }
-});
+if (ENSURE) {
+  // Start a detached background copy unless one is already answering on this port.
+  ping((running) => {
+    if (running) process.exit(0);
+    const child = spawn(process.execPath, [__filename, "--no-open", "--port", String(PORT)], {
+      detached: true, stdio: "ignore", windowsHide: true,
+    });
+    child.unref();
+    process.exit(0);
+  });
+} else {
+  server.on("error", (e) => {
+    if (e.code === "EADDRINUSE") console.error(`Port ${PORT} is busy (the viewer may already be running): open http://localhost:${PORT}`);
+    else console.error(e.message);
+    process.exit(1);
+  });
+
+  server.listen(PORT, "127.0.0.1", () => {
+    const url = `http://localhost:${PORT}`;
+    console.log(`Bob skills: ${url}   (Ctrl+C to stop)`);
+    if (OPEN) {
+      const cmd = process.platform === "win32" ? `start "" "${url}"` : process.platform === "darwin" ? `open "${url}"` : `xdg-open "${url}"`;
+      exec(cmd, () => {});
+    }
+  });
+}
