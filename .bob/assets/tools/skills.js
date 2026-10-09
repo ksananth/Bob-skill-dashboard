@@ -1,21 +1,23 @@
 #!/usr/bin/env node
-// Bob skills helper.
-//   node .bob/assets/tools/skills.js use <skill>    -> log one use by hand (same as the hook does)
-//   node .bob/assets/tools/skills.js reset          -> set every count to 0 and clear the event log
-//   node .bob/assets/tools/skills.js list           -> print skills with their counts
+// Bob skills — one script for everything.
+//
+//   node .bob/assets/tools/skills.js log      Hook: Bob pipes the use_skill call on stdin; adds 1 to that skill's count.
+//   node .bob/assets/tools/skills.js start    Hook: starts the viewer in the background if it isn't running (prints nothing).
+//   node .bob/assets/tools/skills.js serve    Runs the viewer in this terminal and opens http://localhost:4173.
+//
+// Data: assets/data/skills-usage.json  ->  { "<skill-name>": <count>, ... }   (edit or empty it to reset)
 const fs = require("fs");
 const path = require("path");
+const http = require("http");
+const { spawn, exec } = require("child_process");
 
-const ROOT = path.resolve(__dirname, "..", "..");            // the .bob folder
-const SKILLS_DIR = path.join(ROOT, "skills");
-const DATA = path.join(ROOT, "assets", "data");
-const USAGE_FILE = path.join(DATA, "skills-usage.json");
-const EVENTS_FILE = path.join(DATA, "skill-events.json");
+const BOB = path.resolve(__dirname, "..", "..");                     // the .bob folder
+const SKILLS_DIR = path.join(BOB, "skills");
+const USAGE_FILE = path.join(BOB, "assets", "data", "skills-usage.json");
+const PORT = Number(process.env.BOB_SKILLS_PORT) || 4173;
 
-const readJson = (f, d) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return d; } };
-const writeJson = (f, v) => fs.writeFileSync(f, JSON.stringify(v, null, 2) + "\n");
-
-function parseFrontmatter(text) {
+/* ---------- skills ---------- */
+function frontmatter(text) {
   const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   const meta = {};
   if (!m) return meta;
@@ -23,59 +25,104 @@ function parseFrontmatter(text) {
     const kv = line.match(/^(\w[\w-]*):\s*(.*)$/);
     if (!kv) continue;
     let v = kv[2].trim();
-    if (v.startsWith("[") && v.endsWith("]")) v = v.slice(1, -1).split(",").map(s => s.trim()).filter(Boolean);
+    if (v.startsWith("[") && v.endsWith("]")) v = v.slice(1, -1).split(",").map((s) => s.trim()).filter(Boolean);
     else v = v.replace(/^["']|["']$/g, "");
     meta[kv[1]] = v;
   }
   return meta;
 }
 
-function scan() {
+function listSkills() {
   if (!fs.existsSync(SKILLS_DIR)) return [];
-  return fs.readdirSync(SKILLS_DIR, { withFileTypes: true })
-    .filter(d => d.isDirectory())
-    .map(d => {
-      const file = path.join(SKILLS_DIR, d.name, "SKILL.md");
-      if (!fs.existsSync(file)) return null;
-      const text = fs.readFileSync(file, "utf8");
-      const meta = parseFrontmatter(text);
-      return {
-        id: d.name,
-        name: meta.name || d.name,
-        description: meta.description || "",
-        category: meta.category || "Uncategorised",
-        tags: Array.isArray(meta.tags) ? meta.tags : (meta.tags ? [meta.tags] : []),
-        path: `skills/${d.name}/SKILL.md`,
-        body: text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim(),
-      };
-    })
-    .filter(Boolean);
+  return fs.readdirSync(SKILLS_DIR, { withFileTypes: true }).filter((d) => d.isDirectory()).flatMap((d) => {
+    let text;
+    try { text = fs.readFileSync(path.join(SKILLS_DIR, d.name, "SKILL.md"), "utf8"); } catch { return []; }
+    const m = frontmatter(text);
+    return [{
+      id: d.name,
+      name: m.name || d.name,
+      description: m.description || "",
+      category: m.category || "Uncategorised",
+      tags: Array.isArray(m.tags) ? m.tags : m.tags ? [m.tags] : [],
+      path: `skills/${d.name}/SKILL.md`,
+      body: text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim(),
+    }];
+  });
 }
 
-module.exports = { scan };
-
-if (require.main === module) {
-  const [cmd = "list", arg] = process.argv.slice(2);
-  if (cmd === "use") {
-    if (!arg) { console.error("Usage: node .bob/assets/tools/skills.js use <skill-name>"); process.exit(1); }
-    if (!scan().some(s => s.id === arg)) { console.error(`No skill folder named "${arg}" in .bob/skills`); process.exit(1); }
-    const now = new Date();
-    const u = readJson(USAGE_FILE, {});
-    u[arg] = { count: ((u[arg] && u[arg].count) || 0) + 1, lastUsed: now.toISOString().slice(0, 10) };
-    writeJson(USAGE_FILE, u);
-    const ev = readJson(EVENTS_FILE, []);
-    ev.push({ skill: arg, at: now.toISOString(), session: "manual" });
-    writeJson(EVENTS_FILE, ev);
-    console.log(`${arg}: ${u[arg].count} uses`);
-  } else if (cmd === "reset") {
-    const u = {};
-    for (const s of scan()) u[s.id] = { count: 0, lastUsed: null };
-    writeJson(USAGE_FILE, u);
-    writeJson(EVENTS_FILE, []);
-    console.log("All counts set to 0 and event log cleared.");
-  } else {
-    const u = readJson(USAGE_FILE, {});
-    const rows = scan().map(s => [s.id, (u[s.id] && u[s.id].count) || 0]).sort((a, b) => b[1] - a[1]);
-    for (const [id, n] of rows) console.log(String(n).padStart(5) + "  " + id);
-  }
+/* ---------- log (PostToolUse hook on use_skill) ---------- */
+function log() {
+  let raw = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (c) => (raw += c));
+  process.stdin.on("end", () => {
+    try {
+      const input = (JSON.parse(raw || "{}").input) || {};
+      // Bob doesn't document use_skill's parameter name, so try the likely ones, then any value matching a skill.
+      const names = {};
+      for (const s of listSkills()) { names[s.id.toLowerCase()] = s.id; names[s.name.toLowerCase()] = s.id; }
+      let found = ["skill", "skill_name", "skillName", "name"].map((k) => input[k]).find((v) => typeof v === "string" && v.trim());
+      if (!found) found = Object.values(input).find((v) => typeof v === "string" && names[v.trim().toLowerCase()]);
+      if (!found) {
+        fs.appendFileSync(path.join(BOB, "assets", "data", "unmatched.log"), raw + "\n");
+        return;
+      }
+      const id = names[found.trim().toLowerCase()] || found.trim();
+      let usage = {};
+      try { usage = JSON.parse(fs.readFileSync(USAGE_FILE, "utf8")); } catch {}
+      usage[id] = (Number(usage[id]) || 0) + 1;
+      fs.writeFileSync(USAGE_FILE, JSON.stringify(usage, null, 2) + "\n");
+    } catch {}                                                        // never block Bob
+  });
 }
+
+/* ---------- serve (the viewer) ---------- */
+const TYPES = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png" };
+
+function serve(openBrowser) {
+  const server = http.createServer((req, res) => {
+    const send = (code, body, type = "text/plain", extra = {}) => {
+      res.writeHead(code, { "Content-Type": type + "; charset=utf-8", "Cache-Control": "no-store", ...extra });
+      res.end(body);
+    };
+    let p;
+    try { p = decodeURIComponent(new URL(req.url, "http://x").pathname); } catch { return send(400, "Bad request"); }
+    if (p === "/api/ping") return send(200, '{"app":"bob-skills"}', "application/json", { "Access-Control-Allow-Origin": "*" });
+    if (p === "/api/skills") return send(200, JSON.stringify(listSkills()), "application/json");
+    if (p === "/") p = "/index.html";
+    const file = path.resolve(BOB, "." + p);
+    if (!file.startsWith(BOB + path.sep) || /settings\.json$/i.test(file)) return send(404, "Not found");
+    fs.readFile(file, (err, data) => {
+      if (err) return send(404, "Not found");
+      res.writeHead(200, { "Content-Type": (TYPES[path.extname(file)] || "application/octet-stream") + "; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(data);
+    });
+  });
+  server.on("error", (e) => {
+    console.error(e.code === "EADDRINUSE" ? `Already running: http://localhost:${PORT}` : e.message);
+    process.exit(1);
+  });
+  server.listen(PORT, "127.0.0.1", () => {
+    const url = `http://localhost:${PORT}`;
+    if (!openBrowser) return;
+    console.log(`Bob skills: ${url}   (Ctrl+C to stop)`);
+    exec(process.platform === "win32" ? `start "" "${url}"` : process.platform === "darwin" ? `open "${url}"` : `xdg-open "${url}"`, () => {});
+  });
+}
+
+/* ---------- start (SessionStart hook) ---------- */
+function start() {
+  const req = http.get({ host: "127.0.0.1", port: PORT, path: "/api/ping", timeout: 800 }, () => process.exit(0)); // already running
+  const launch = () => {
+    spawn(process.execPath, [__filename, "serve-quiet"], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+    process.exit(0);
+  };
+  req.on("timeout", () => { req.destroy(); launch(); });
+  req.on("error", launch);
+}
+
+const cmd = process.argv[2];
+if (cmd === "log") log();
+else if (cmd === "start") start();
+else if (cmd === "serve-quiet") serve(false);
+else serve(true);

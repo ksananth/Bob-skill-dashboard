@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node .bob/assets/tools/serve.js --ensure",
+            "command": "node .bob/assets/tools/skills.js start",
             "timeout": 5
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node .bob/assets/tools/log-skill.js",
+            "command": "node .bob/assets/tools/skills.js log",
             "timeout": 10
           }
         ]

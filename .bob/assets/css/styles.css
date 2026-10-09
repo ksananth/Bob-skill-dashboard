@@ -67,8 +67,6 @@ h1 { font-size: 20px; font-weight: 700; letter-spacing: -.02em; margin: 0; }
 }
 .icon-btn:hover { color: var(--text); border-color: color-mix(in srgb, var(--text) 18%, var(--line)); }
 .icon-btn.square { width: 36px; padding: 0; justify-content: center; }
-.icon-btn.spin svg { animation: spin .8s linear; }
-@keyframes spin { to { transform: rotate(360deg); } }
 #theme .moon { display: none; }
 :root[data-theme="dark"] #theme .sun { display: none; }
 :root[data-theme="dark"] #theme .moon { display: block; }
@@ -192,7 +190,6 @@ kbd { border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5p
 .unit { font-size: 12px; color: var(--text-3); }
 .bar { width: 100%; height: 5px; background: var(--track); border-radius: 5px; overflow: hidden; }
 .bar i { display: block; height: 100%; border-radius: 5px; background: var(--accent); transition: width .35s ease; }
-.when { font-size: 11.5px; color: var(--text-3); }
 
 mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1px; }
 
@@ -271,9 +268,6 @@ mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1
 .card dl div { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; }
 .card dt { color: var(--text-3); }
 .card dd { margin: 0; font-weight: 500; font-variant-numeric: tabular-nums; text-align: right; }
-.cmd { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
-.cmd code { flex: 1; min-width: 0; display: block; padding: 8px 10px; font-size: 11.5px; line-height: 1.5; overflow-wrap: break-word; }
-.icon-btn.copied { color: var(--accent-text); border-color: var(--accent); }
 
 /* ---------- Responsive ---------- */
 @media (max-width: 900px) {
@@ -304,27 +298,8 @@ mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1
   .rank { display: none; }
   .usage { flex-direction: row-reverse; align-items: center; gap: 10px; }
   .usage .bar { flex: 1; }
-  .usage .when { display: none; }
   .d-side { grid-template-columns: 1fr; }
   .d-title { font-size: 21px; }
   .d-desc { font-size: 15px; }
   .md { padding: 18px 18px 20px; }
 }
-
-/* Recent uses */
-.hist { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 2px; }
-.hist li { display: flex; justify-content: space-between; font-size: 13px; padding: 5px 0; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums; }
-.hist li:first-child { border-top: 0; }
-.hist li span:last-child { color: var(--text-3); }
-.hist-empty { margin: 8px 0 0; font-size: 12.5px; color: var(--text-3); line-height: 1.5; }
-
-/* Connect button in the empty state */
-.primary {
-  margin-top: 16px; height: 40px; padding: 0 18px; border: 0; border-radius: var(--radius-sm);
-  background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; box-shadow: var(--shadow-lg);
-  transition: filter .15s, transform .15s;
-}
-.primary:hover { filter: brightness(1.08); }
-.primary:active { transform: translateY(1px); }
-.empty .note { display: inline-block; margin-bottom: 6px; color: var(--text); font-weight: 500; }
-.empty p { line-height: 1.8; }
