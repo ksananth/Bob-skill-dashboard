@@ -9,9 +9,16 @@
 //                        double-clicked index.html read .json files but will load .js files.
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 
 const BOB = path.resolve(__dirname, "..", "..");                     // the .bob folder
-const SKILLS_DIR = path.join(BOB, "skills");
+// Where skills can live (first match of a name wins, like Bob: project skills override global ones).
+const SKILL_DIRS = [...new Set([
+  path.join(BOB, "skills"),                          // index.html sits inside .bob
+  path.join(BOB, ".bob", "skills"),                  // index.html sits in the repo root
+  path.join(process.cwd(), ".bob", "skills"),        // hooks run from the repo root
+  path.join(os.homedir(), ".bob", "skills"),         // Bob's global skills
+])];
 const USAGE_FILE = path.join(BOB, "assets", "data", "skills-usage.json");
 const DATA_FILE = path.join(BOB, "assets", "data", "skills-data.js");
 
@@ -20,10 +27,17 @@ function frontmatter(text) {
   const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   const meta = {};
   if (!m) return meta;
-  for (const line of m[1].split(/\r?\n/)) {
-    const kv = line.match(/^(\w[\w-]*):\s*(.*)$/);
+  const lines = m[1].split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const kv = lines[i].match(/^(\w[\w-]*):\s*(.*)$/);
     if (!kv) continue;
     let v = kv[2].trim();
+    if (v === "" || /^[>|][+-]?$/.test(v)) {                 // multi-line value (YAML > or |, or indented lines)
+      const more = [];
+      while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1])) more.push(lines[++i].trim());
+      if (more.length && more.every((l) => l.startsWith("- "))) { meta[kv[1]] = more.map((l) => l.slice(2).trim()); continue; }
+      v = more.join(" ");
+    }
     if (v.startsWith("[") && v.endsWith("]")) v = v.slice(1, -1).split(",").map((s) => s.trim()).filter(Boolean);
     else v = v.replace(/^["']|["']$/g, "");
     meta[kv[1]] = v;
@@ -32,21 +46,31 @@ function frontmatter(text) {
 }
 
 function listSkills() {
-  if (!fs.existsSync(SKILLS_DIR)) return [];
-  return fs.readdirSync(SKILLS_DIR, { withFileTypes: true }).filter((d) => d.isDirectory()).flatMap((d) => {
-    let text;
-    try { text = fs.readFileSync(path.join(SKILLS_DIR, d.name, "SKILL.md"), "utf8"); } catch { return []; }
-    const m = frontmatter(text);
-    return [{
-      id: d.name,
-      name: m.name || d.name,
-      description: m.description || "",
-      category: m.category || "Uncategorised",
-      tags: Array.isArray(m.tags) ? m.tags : m.tags ? [m.tags] : [],
-      path: `skills/${d.name}/SKILL.md`,
-      body: text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim(),
-    }];
-  });
+  const seen = new Set();
+  const out = [];
+  for (const dir of SKILL_DIRS) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    const global = dir === path.join(os.homedir(), ".bob", "skills");
+    for (const d of entries) {
+      if (!d.isDirectory() || seen.has(d.name)) continue;
+      let text;
+      try { text = fs.readFileSync(path.join(dir, d.name, "SKILL.md"), "utf8"); } catch { continue; }
+      const m = frontmatter(text);
+      if (!m.description) continue;                         // Bob ignores skills without a description too
+      seen.add(d.name);
+      out.push({
+        id: d.name,
+        name: m.name || d.name,
+        description: m.description,
+        category: m.category || (global ? "Global" : "Uncategorised"),
+        tags: Array.isArray(m.tags) ? m.tags : m.tags ? String(m.tags).split(",").map((t) => t.trim()).filter(Boolean) : [],
+        path: (global ? "~/.bob/skills/" : "skills/") + d.name + "/SKILL.md",
+        body: text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim(),
+      });
+    }
+  }
+  return out.sort((a, b) => a.id.localeCompare(b.id));
 }
 
 /* ---------- log (PostToolUse hook on use_skill) ---------- */
@@ -87,4 +111,10 @@ function build() {
 
 const cmd = process.argv[2];
 if (cmd === "log") log();
-else { build(); if (process.stdout.isTTY) console.log("Updated assets/data/skills-data.js"); }
+else {
+  build();
+  if (process.stdout.isTTY) {
+    const n = listSkills().length;
+    console.log(n ? `Found ${n} skills -> assets/data/skills-data.js` : "No skills found. Looked in:\n  " + SKILL_DIRS.join("\n  "));
+  }
+}
