@@ -1,9 +1,9 @@
 (() => {
   "use strict";
 
-  // Skills come from the viewer (api/skills, read from each SKILL.md).
-  // Counts come from assets/data/skills-usage.json  ->  { "<skill>": <count> }
-  const VIEWER = "http://localhost:4173";
+  // Data: assets/data/skills-data.js (written by the Bob hook from skills-usage.json + each SKILL.md).
+  // Loaded as a <script> so it works when index.html is simply double-clicked.
+  const DATA_URL = "assets/data/skills-data.js";
   const POLL_MS = 3000;
 
   const $ = (id) => document.getElementById(id);
@@ -34,50 +34,46 @@
   });
 
   /* ---------- data ---------- */
-  async function getText(url) {
-    const r = await fetch(url + "?t=" + Date.now(), { cache: "no-store" });
-    if (!r.ok) throw new Error(url);
-    return r.text();
+  // (Re)load the data script; a fresh <script> each time picks up new counts.
+  function loadScript() {
+    return new Promise((resolve, reject) => {
+      const el = document.createElement("script");
+      el.src = DATA_URL + "?t=" + Date.now();
+      el.onload = () => { el.remove(); resolve(window.BOB_SKILLS); };
+      el.onerror = () => { el.remove(); reject(new Error("missing")); };
+      document.head.appendChild(el);
+    });
   }
 
   async function load() {
-    const [skillsText, usageText] = await Promise.all([
-      getText("api/skills"),
-      getText("assets/data/skills-usage.json").catch(() => "{}"),
-    ]);
-    const snapshot = skillsText + "\u0000" + usageText;
-    if (snapshot === lastSnapshot) return;                     // nothing changed since last poll
+    window.BOB_SKILLS = undefined;
+    const data = await loadScript();
+    if (!Array.isArray(data)) throw new Error("bad data");
+    const snapshot = JSON.stringify(data);
+    if (snapshot === lastSnapshot) return;                     // nothing changed since last check
     lastSnapshot = snapshot;
 
-    let usage = {};
-    try { usage = JSON.parse(usageText) || {}; } catch {}
-    skills = JSON.parse(skillsText).map((s) => ({ ...s, count: Number(usage[s.id]) || 0 }));
-
+    skills = data.map((s) => ({ ...s, tags: s.tags || [], count: Number(s.count) || 0 }));
     catColor = {};
     [...new Set(skills.map((s) => s.category))].sort().forEach((c, i) => (catColor[c] = PALETTE[i % PALETTE.length]));
     if (state.cat && !catColor[state.cat]) state.cat = "";
     $("source").textContent = `${skills.length} skills · counts from skills-usage.json`;
+    $("empty").querySelector("p").textContent = "No skills match these filters.";
+    $("reset").hidden = false;
     renderFilters();
     render();
     route();
   }
 
   async function start() {
-    // Double-clicked index.html: switch to the viewer if it's running (Bob starts it on session start).
-    if (location.protocol === "file:") {
-      try {
-        const r = await fetch(VIEWER + "/api/ping", { cache: "no-store" });
-        if (r.ok) { location.replace(VIEWER + "/" + location.hash); return; }
-      } catch {}
-      $("source").textContent = "Viewer not running";
-      $("list").hidden = true;
-      $("empty").hidden = false;
-      $("reset").hidden = true;
+    try {
+      await load();
+    } catch {
+      $("source").textContent = "No data yet";
+      $("list").hidden = true; $("empty").hidden = false; $("reset").hidden = true;
       $("empty").querySelector("p").innerHTML =
-        "The skills viewer isn't running. Bob starts it when a session begins,<br>or start it yourself with <code>node .bob/assets/tools/skills.js</code>";
-      return;
+        "No data file yet. It's created when a Bob session starts,<br>or run <code>node .bob/assets/tools/skills.js build</code> once.";
     }
-    try { await load(); } catch { $("source").textContent = "Couldn't load the skills — is the viewer still running?"; }
     setInterval(() => { if (!document.hidden) load().catch(() => {}); }, POLL_MS);
   }
 
