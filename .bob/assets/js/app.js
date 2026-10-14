@@ -1,17 +1,18 @@
 (() => {
   "use strict";
 
-  // Skill list: assets/data/skills-data.js (built from each SKILL.md by the Bob hook).
-  // Loaded as a <script> so it works when index.html is simply double-clicked.
+  // Skill list: read straight from the SKILL.md files every time the page opens (and every few seconds).
+  // A page can't open a folder by itself, so the first time you pick the skills folder; the browser
+  // remembers it (kept in IndexedDB). Needs Chrome or Edge.
   // Usage: Firestore collection "skills" -> { count, lastUsedAt }, pushed here live by onSnapshot.
-  const DATA_URL = "assets/data/skills-data.js";
   const POLL_MS = 3000;
 
   const $ = (id) => document.getElementById(id);
   const DEFAULTS = { q: "", cat: "", tag: "", usage: "all", key: "count", dir: "desc" };
   const state = { ...DEFAULTS };
   const PALETTE = ["#4f46e5", "#0ea5e9", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6"];
-  let base = [];            // skills from skills-data.js
+  let base = [];            // skills read from the SKILL.md files
+  let folder = null;        // the picked folder (FileSystemDirectoryHandle)
   let usage = {};           // id -> { count, lastUsed (ms, 0 = never) } from Firestore
   let live = "connecting";  // connecting | live | off | error
   let liveError = "";
@@ -48,30 +49,150 @@
     try { localStorage.setItem("bob-theme", dark ? "light" : "dark"); } catch {}
   });
 
-  /* ---------- data ---------- */
-  // (Re)load the data script; a fresh <script> each time picks up new counts.
-  function loadScript() {
+  /* ---------- skills folder ---------- */
+  // Remember the picked folder between visits (a folder handle can only be stored in IndexedDB).
+  function idb(mode, fn) {
     return new Promise((resolve, reject) => {
-      const el = document.createElement("script");
-      el.src = DATA_URL + "?t=" + Date.now();
-      el.onload = () => { el.remove(); resolve(window.BOB_SKILLS); };
-      el.onerror = () => { el.remove(); reject(new Error("missing")); };
-      document.head.appendChild(el);
+      const open = indexedDB.open("bob-skills", 1);
+      open.onupgradeneeded = () => open.result.createObjectStore("kv");
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => {
+        try {
+          const tx = open.result.transaction("kv", mode);
+          const req = fn(tx.objectStore("kv"));
+          tx.oncomplete = () => resolve(req && req.result);
+          tx.onerror = () => reject(tx.error);
+        } catch (err) { reject(err); }
+      };
     });
+  }
+  const savedFolder = () => idb("readonly", (s) => s.get("folder")).catch(() => null);
+  const saveFolder = (h) => idb("readwrite", (s) => s.put(h, "folder")).catch(() => {});
+
+  async function child(dir, name) {
+    try { return await dir.getDirectoryHandle(name); } catch { return null; }
+  }
+  // Accept the skills folder itself, the .bob folder, or the repo root.
+  async function skillsDir(dir) {
+    if (dir.name === "skills") return dir;
+    const direct = await child(dir, "skills");
+    if (direct) return direct;
+    const bob = await child(dir, ".bob");
+    return bob ? child(bob, "skills") : null;
+  }
+
+  function frontmatter(text) {
+    const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    const meta = {};
+    if (!m) return meta;
+    const lines = m[1].split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const kv = lines[i].match(/^(\w[\w-]*):\s*(.*)$/);
+      if (!kv) continue;
+      let v = kv[2].trim();
+      if (v === "" || /^[>|][+-]?$/.test(v)) {                 // multi-line value (YAML > or |, or indented lines)
+        const more = [];
+        while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1])) more.push(lines[++i].trim());
+        if (more.length && more.every((l) => l.startsWith("- "))) { meta[kv[1]] = more.map((l) => l.slice(2).trim()); continue; }
+        v = more.join(" ");
+      }
+      if (v.startsWith("[") && v.endsWith("]")) v = v.slice(1, -1).split(",").map((x) => x.trim()).filter(Boolean);
+      else v = v.replace(/^["']|["']$/g, "");
+      meta[kv[1]] = v;
+    }
+    return meta;
+  }
+
+  async function readSkills(dir) {
+    const out = [];
+    for await (const [name, entry] of dir.entries()) {
+      if (entry.kind !== "directory") continue;
+      let text;
+      try { text = await (await (await entry.getFileHandle("SKILL.md")).getFile()).text(); } catch { continue; }
+      const m = frontmatter(text);
+      if (!m.description) continue;                             // Bob ignores skills without a description too
+      out.push({
+        id: name,
+        name: m.name || name,
+        description: m.description,
+        category: m.category || "Uncategorised",
+        tags: Array.isArray(m.tags) ? m.tags : m.tags ? String(m.tags).split(",").map((t) => t.trim()).filter(Boolean) : [],
+        path: "skills/" + name + "/SKILL.md",
+        body: text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim(),
+      });
+    }
+    return out.sort((a, b) => a.id.localeCompare(b.id));
   }
 
   async function load() {
-    window.BOB_SKILLS = undefined;
-    const data = await loadScript();
-    if (!Array.isArray(data)) throw new Error("bad data");
+    if (!folder) return;
+    const data = await readSkills(folder);
     const snapshot = JSON.stringify(data);
     if (snapshot === lastSnapshot) return;                     // nothing changed since last check
     lastSnapshot = snapshot;
-    base = data.map((s) => ({ ...s, tags: s.tags || [] }));
+    base = data;
+    $("list").hidden = false;
     $("empty").querySelector("p").textContent = "No skills match these filters.";
     $("reset").hidden = false;
     refresh();
   }
+
+  // Shown until the folder is readable. kind: "pick" (first time), "allow" (browser wants a click), "unsupported".
+  function askForFolder(kind, note) {
+    const msg = {
+      pick: "Choose your <code>.bob/skills</code> folder once. The browser remembers it after that.",
+      allow: "Click to let this page read your skills again.",
+      unsupported: "This browser can't read folders. Open the dashboard in <b>Chrome</b> or <b>Edge</b>.",
+    }[kind];
+    $("source").textContent = "Skills folder not opened";
+    $("stats").innerHTML = "";
+    $("list").hidden = true; $("empty").hidden = false; $("reset").hidden = true;
+    $("empty").querySelector("p").innerHTML = msg + (note ? `<br><small>${esc(note)}</small>` : "") +
+      (kind === "unsupported" ? "" : `<br><button class="icon-btn" id="pickFolder" style="margin-top:14px">${kind === "pick" ? "Choose skills folder" : "Allow"}</button>`);
+  }
+
+  async function openFolder(handle) {
+    const dir = await skillsDir(handle);
+    if (!dir) return askForFolder("pick", `"${handle.name}" has no skills folder in it. Pick .bob/skills.`);
+    folder = dir;
+    saveFolder(handle);                                        // remember it for next time (never blocks loading)
+    lastSnapshot = "";
+    await load();
+  }
+
+  async function pick() {
+    try { await openFolder(await window.showDirectoryPicker({ id: "bob-skills", mode: "read" })); }
+    catch (err) { if (err.name !== "AbortError") askForFolder("pick", err.message); }
+  }
+
+  async function allow(handle) {
+    try {
+      if ((await handle.requestPermission({ mode: "read" })) === "granted") return openFolder(handle);
+    } catch {}
+    askForFolder("pick", "Permission wasn't given. Pick the folder again.");
+  }
+
+  async function connectFolder() {
+    if (!window.showDirectoryPicker) return askForFolder("unsupported");
+    const saved = await savedFolder();
+    if (!saved) return askForFolder("pick");
+    let perm = "prompt";
+    try { perm = await saved.queryPermission({ mode: "read" }); } catch {}
+    if (perm === "granted") {
+      try { return await openFolder(saved); } catch {}
+      return askForFolder("pick", "The saved folder can't be read any more (moved or deleted?). Pick it again.");
+    }
+    askForFolder("allow");
+    $("empty").dataset.saved = "1";
+  }
+
+  $("folderBtn").addEventListener("click", pick);
+  $("empty").addEventListener("click", async (e) => {
+    if (e.target.id !== "pickFolder") return;
+    const saved = $("empty").dataset.saved ? await savedFolder() : null;
+    delete $("empty").dataset.saved;
+    if (saved) allow(saved); else pick();
+  });
 
   // Merge the skill list with the live Firestore numbers and redraw.
   function refresh() {
@@ -115,15 +236,10 @@
   async function start() {
     connectFirestore();
     setInterval(() => { if (!document.hidden && live === "live") render(); }, 60000);   // keep "x min ago" fresh
-    try {
-      await load();
-    } catch {
-      $("source").textContent = "No data yet";
-      $("list").hidden = true; $("empty").hidden = false; $("reset").hidden = true;
-      $("empty").querySelector("p").innerHTML =
-        "No data file yet. It's created when a Bob session starts,<br>or run <code>node .bob/assets/tools/skills.js build</code> once.";
-    }
+    await connectFolder();
+    // Re-read the SKILL.md files every few seconds, so added or edited skills show up without reloading.
     setInterval(() => { if (!document.hidden) load().catch(() => {}); }, POLL_MS);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) load().catch(() => {}); });
   }
 
   /* ---------- filtering ---------- */

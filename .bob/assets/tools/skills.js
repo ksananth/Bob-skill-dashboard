@@ -1,30 +1,23 @@
 #!/usr/bin/env node
-// Bob skills — one script, run by the hooks in .bob/settings.json.
+// Bob skills — records skill usage in Firestore. Run by the hook in .bob/settings.json.
 //
 //   node .bob/assets/tools/skills.js log           After each use_skill: adds 1 to that skill in Firestore and sets its last-used time.
 //   node .bob/assets/tools/skills.js log <skill>   Same, by hand (handy to test the Firestore setup).
-//   node .bob/assets/tools/skills.js start         On session start: builds, and starts the watcher in the background if needed.
-//   node .bob/assets/tools/skills.js build         Rebuilds assets/data/skills-data.js now (also run on every prompt).
-//   node .bob/assets/tools/skills.js watch         Watches skills/ and rebuilds on any change.
 //
-// Firestore          ->  skills/<skill-name> = { count, lastUsedAt }   the usage numbers, shared by everyone
-// skills-data.js     ->  the list of skills (each SKILL.md), as a script, because browsers won't let a
-//                        double-clicked index.html list folders, but will load .js files.
+// Firestore  ->  skills/<skill-name> = { count, lastUsedAt }   the usage numbers, shared by everyone.
+// The dashboard (index.html) reads the SKILL.md files itself, so nothing is generated here.
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { spawn } = require("child_process");
 
 const BOB = path.resolve(__dirname, "..", "..");                     // the .bob folder
-// Where skills can live (first match of a name wins, like Bob: project skills override global ones).
+// Where skills can live, used to match the name Bob passes to use_skill (project skills override global ones).
 const SKILL_DIRS = [...new Set([
   path.join(BOB, "skills"),                          // index.html sits inside .bob
   path.join(BOB, ".bob", "skills"),                  // index.html sits in the repo root
   path.join(process.cwd(), ".bob", "skills"),        // hooks run from the repo root
   path.join(os.homedir(), ".bob", "skills"),         // Bob's global skills
 ])];
-const DATA_FILE = path.join(BOB, "assets", "data", "skills-data.js");
-const PID_FILE = path.join(BOB, "assets", "data", "watcher.pid");
 const CONFIG_FILE = path.join(BOB, "assets", "data", "firebase-config.js");
 const ERROR_LOG = path.join(BOB, "assets", "data", "firestore-errors.log");
 
@@ -155,58 +148,6 @@ function log(manual) {
   });
 }
 
-/* ---------- build ---------- */
-function build() {
-  // Write only when something changed, so the watcher doesn't react to its own output.
-  const skills = listSkills();
-  const out = "// Generated from the SKILL.md files by skills.js - do not edit. Usage counts live in Firestore.\n" +
-    "window.BOB_SKILLS = " + JSON.stringify(skills) + ";\n";
-  let old = "";
-  try { old = fs.readFileSync(DATA_FILE, "utf8"); } catch {}
-  if (out !== old) fs.writeFileSync(DATA_FILE, out);
-  return skills.length;
-}
-
-/* ---------- watch (keeps skills-data.js live) ---------- */
-function watcherRunning() {
-  try { process.kill(Number(fs.readFileSync(PID_FILE, "utf8")), 0); return true; } catch { return false; }
-}
-
-function watch() {
-  fs.writeFileSync(PID_FILE, String(process.pid));
-  const cleanup = () => { try { if (fs.readFileSync(PID_FILE, "utf8") === String(process.pid)) fs.unlinkSync(PID_FILE); } catch {} process.exit(0); };
-  process.on("SIGINT", cleanup); process.on("SIGTERM", cleanup);
-
-  let timer = null;
-  const rebuild = () => { clearTimeout(timer); timer = setTimeout(() => { try { build(); } catch {} }, 300); };
-  const watched = new Map();
-  const watchDir = (dir) => {
-    if (watched.has(dir) || !fs.existsSync(dir)) return;
-    try {
-      const w = fs.watch(dir, { recursive: true }, rebuild);       // recursive: Windows, macOS, Node 20+ on Linux
-      w.on("error", () => { watched.delete(dir); });
-      watched.set(dir, w);
-    } catch {}
-  };
-  const watchAll = () => { SKILL_DIRS.forEach(watchDir); };
-  watchAll();
-  setInterval(() => { watchAll(); rebuild(); }, 30000);             // pick up a skills/ folder created later; safety rebuild
-  build();
-  if (process.stdout.isTTY) console.log("Watching skills for changes (Ctrl+C to stop)");
-}
-
-function start() {
-  build();
-  if (!watcherRunning()) {
-    spawn(process.execPath, [__filename, "watch"], { detached: true, stdio: "ignore", windowsHide: true }).unref();
-  }
-}
-
 const cmd = process.argv[2];
 if (cmd === "log") log(process.argv[3]);
-else if (cmd === "start") start();
-else if (cmd === "watch") watch();
-else {
-  const n = build();
-  if (process.stdout.isTTY) console.log(n ? `Found ${n} skills -> assets/data/skills-data.js` : "No skills found. Looked in:\n  " + SKILL_DIRS.join("\n  "));
-}
+else console.log("Usage: node .bob/assets/tools/skills.js log [skill-name]");

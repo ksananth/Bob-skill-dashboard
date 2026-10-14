@@ -10,8 +10,12 @@ Dashboard of Bob skills with live usage counts and last-used time, stored in Fir
 
 Needs Node 18+ (uses built-in `fetch`, nothing to `npm install`).
 
+## Opening the dashboard
+
+Double-click `.bob/index.html` in **Chrome or Edge**. The first time, click **Choose skills folder** and pick `.bob/skills` (the `.bob` folder or the repo root also work). The browser remembers it; if it asks again, click **Allow** (tick "Allow on every visit" if offered). The folder button at the top changes it.
+
 ## How it works
 
 - Bob's `PostToolUse` hook on `use_skill` runs `skills.js log`, which adds 1 to `skills/<skill-name>.count` and sets `lastUsedAt` in Firestore.
-- `index.html` lists the skills from `assets/data/skills-data.js` (built from each `SKILL.md`) and gets the counts live from Firestore.
+- `index.html` reads every `SKILL.md` directly each time it opens (and every few seconds), and gets the counts live from Firestore. Nothing is generated, so there's nothing to commit when skills change.
 - If a write fails, Bob is never blocked; the reason goes to `.bob/assets/data/firestore-errors.log`.
