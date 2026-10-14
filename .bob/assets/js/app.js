@@ -204,7 +204,7 @@
     const status = {
       connecting: "connecting to Firestore…",
       live: "live counts from Firestore",
-      off: "Firestore not set up: fill in assets/data/firebase-config.js",
+      off: "Firestore not set up: fill in assets/data/skills-firebase-db-config.js",
       error: "Firestore error: " + liveError,
     }[live];
     $("source").textContent = `${skills.length} skills · ${status}`;

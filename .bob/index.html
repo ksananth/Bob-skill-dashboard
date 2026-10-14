@@ -90,7 +90,7 @@
           <summary>How it updates</summary>
           <p>Each time Bob activates a skill, the hook in <code>.bob/settings.json</code> adds 1 to that skill's count in Firestore and sets its last-used time. This page gets the new numbers instantly.</p>
           <p>The skill list is read straight from the <code>SKILL.md</code> files each time this page opens, and again every few seconds, so new or edited skills appear by themselves. Nothing is generated and there's nothing to commit. Use the folder button at the top to point it at a different skills folder.</p>
-          <p>Counts not arriving? Run <code>node .bob/assets/tools/skills.js log &lt;skill-name&gt;</code> to test, and check <code>assets/data/firestore-errors.log</code>. To reset a count, delete that skill's document in the Firebase console.</p>
+          <p>Counts not arriving? Run <code>node .bob/assets/tools/track-skill-usage.js &lt;skill-name&gt;</code> to test, and check <code>assets/data/firestore-errors.log</code>. To reset a count, delete that skill's document in the Firebase console.</p>
         </details>
       </main>
     </div>
@@ -102,7 +102,7 @@
 
   <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
-  <script src="assets/data/firebase-config.js"></script>
+  <script src="assets/data/skills-firebase-db-config.js"></script>
   <script src="assets/js/app.js"></script>
 </body>
 </html>

@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node .bob/assets/tools/skills.js log",
+            "command": "node .bob/assets/tools/track-skill-usage.js",
             "timeout": 10
           }
         ]
