@@ -1,9 +1,14 @@
 // Firebase settings, shared by the dashboard (index.html) and the Bob hook (track-skill-usage.js).
-// Copy them from Firebase Console -> Project settings -> Your apps -> Web app (</>).
-// The apiKey is not a secret: it only says which project to talk to. firestore.rules protects the data.
+//
+// SETUP: fill in your values below. They come from
+// Firebase Console -> Project settings -> Your apps -> Web app (</>).
+//
+// Keep your key out of git: after filling it in, run this once in the repo folder
+//     git update-index --skip-worktree .bob/assets/data/skills-firebase-db-config.js
+// so git ignores your local changes to this file.
 const BOB_FIREBASE = {
-  apiKey: "AIzaSyCVE03aEfAeY4dnjw2GcwuJtw-GaocyPLM",
-  projectId: "bob-skills-dashboard-1442d",
+  apiKey: "YOUR_API_KEY",
+  projectId: "YOUR_PROJECT_ID",
 };
 
 if (typeof module !== "undefined") module.exports = BOB_FIREBASE;   // Node (track-skill-usage.js)

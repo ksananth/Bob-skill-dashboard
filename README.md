@@ -4,7 +4,7 @@ Dashboard of Bob skills with live usage counts and last-used time, stored in Fir
 
 ## Setup (once)
 
-1. **Firebase config:** in Firebase Console → Project settings → Your apps → Web app, copy `apiKey` and `projectId` into `.bob/assets/data/skills-firebase-db-config.js`.
+1. **Firebase config:** fill in `apiKey` and `projectId` in `.bob/assets/data/skills-firebase-db-config.js` (from Firebase Console → Project settings → Your apps → Web app). Then run `git update-index --skip-worktree .bob/assets/data/skills-firebase-db-config.js` once, so your key is never committed.
 2. **Security rules:** paste `firestore.rules` into Firestore → Rules → Publish. They only allow "+1 to count, last used = now", so nobody can set fake numbers.
 3. **Test:** `node .bob/assets/tools/track-skill-usage.js compose-screen` should print "Recorded 1 use", and the dashboard updates instantly.
 
