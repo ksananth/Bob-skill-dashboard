@@ -1,517 +1,889 @@
+// =============================================================================
+// Bob Skills dashboard
+//
+// Where the data comes from:
+//   - The skills:  every SKILL.md in the skills folder, read directly by this page.
+//                  (A page can't open a folder on its own, so you pick it once and the
+//                  browser remembers it. Needs Chrome or Edge.)
+//   - The usage:   Firestore, collection "skills" -> { count, lastUsedAt } per skill folder.
+//                  Updates arrive live, no refresh needed.
+//
+// Sections, in order:
+//   1. Settings and state      5. Combine skills + usage     9. Detail screen
+//   2. Small helpers           6. Filter and sort           10. Markdown
+//   3. Skills folder           7. Theme                     11. Clicks and keys
+//   4. Firestore               8. List screen               12. Start
+// =============================================================================
+
 (() => {
   "use strict";
 
-  // Skill list: read straight from the SKILL.md files every time the page opens (and every few seconds).
-  // A page can't open a folder by itself, so the first time you pick the skills folder; the browser
-  // remembers it (kept in IndexedDB). Needs Chrome or Edge.
-  // Usage: Firestore collection "skills" -> { count, lastUsedAt }, pushed here live by onSnapshot.
-  const POLL_MS = 3000;
+  // ===========================================================================
+  // 1. Settings and state
+  // ===========================================================================
 
-  const $ = (id) => document.getElementById(id);
-  const DEFAULTS = { q: "", cat: "", tag: "", usage: "all", key: "count", dir: "desc" };
-  const state = { ...DEFAULTS };
-  const PALETTE = ["#4f46e5", "#0ea5e9", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6"];
-  let base = [];            // skills read from the SKILL.md files
-  let folder = null;        // the picked folder (FileSystemDirectoryHandle)
-  let usage = {};           // id -> { count, lastUsed (ms, 0 = never) } from Firestore
-  let live = "connecting";  // connecting | live | off | error
-  let liveError = "";
-  let skills = [];          // base + usage, what the screens show
-  let catColor = {};
-  let lastSnapshot = "";
+  const RE_READ_SKILLS_EVERY_MS = 3000;     // picks up new or edited SKILL.md files
+  const REFRESH_TIMES_EVERY_MS = 60000;     // keeps "5 min ago" up to date
 
-  /* ---------- helpers ---------- */
-  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  const highlight = (text, q) => {
-    const safe = esc(text);
-    if (!q) return safe;
-    const re = new RegExp("(" + esc(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ")", "ig");
-    return safe.replace(re, "<mark>$1</mark>");
-  };
-  const plural = (n) => (n === 1 ? "use" : "uses");
-  const ago = (ms) => {
-    if (!ms) return "never";
-    const s = Math.max(0, (Date.now() - ms) / 1000);
-    if (s < 60) return "just now";
-    if (s < 3600) return Math.floor(s / 60) + " min ago";
-    if (s < 86400) return Math.floor(s / 3600) + " h ago";
-    if (s < 86400 * 30) return Math.floor(s / 86400) + " d ago";
-    return new Date(ms).toLocaleDateString();
-  };
-  const fullDate = (ms) => (ms ? new Date(ms).toLocaleString() : "Never");
+  const CATEGORY_COLORS = ["#4f46e5", "#0ea5e9", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6"];
 
-  /* ---------- theme ---------- */
-  try { const t = localStorage.getItem("bob-theme"); if (t) document.documentElement.dataset.theme = t; } catch {}
-  $("theme").addEventListener("click", () => {
-    const cur = document.documentElement.dataset.theme;
-    const dark = cur ? cur === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
-    document.documentElement.dataset.theme = dark ? "light" : "dark";
-    try { localStorage.setItem("bob-theme", dark ? "light" : "dark"); } catch {}
-  });
+  const DEFAULT_FILTERS = { search: "", category: "", tag: "", usage: "all", sortBy: "count", sortDirection: "desc" };
+  const filters = { ...DEFAULT_FILTERS };
 
-  /* ---------- skills folder ---------- */
-  // Remember the picked folder between visits (a folder handle can only be stored in IndexedDB).
-  function idb(mode, fn) {
+  let skillsFolder = null;          // the folder the user picked
+  let skillsFromFiles = [];         // what the SKILL.md files say
+  let lastFilesSnapshot = "";       // to skip redrawing when nothing changed
+  let usageFromFirestore = {};      // folder name -> { count, lastUsed }
+  let firestoreStatus = "connecting";   // connecting | live | off | error
+  let firestoreError = "";
+
+  let skills = [];                  // skillsFromFiles + their usage: what the screens show
+  let categoryColor = {};           // category name -> color
+
+  // ===========================================================================
+  // 2. Small helpers
+  // ===========================================================================
+
+  const byId = (id) => document.getElementById(id);
+
+  // Makes text safe to put inside HTML.
+  function escapeHtml(text) {
+    const replacements = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+    return String(text ?? "").replace(/[&<>"']/g, (char) => replacements[char]);
+  }
+
+  // Escapes text and wraps every match of the search in <mark>.
+  function highlightSearch(text, search) {
+    const safeText = escapeHtml(text);
+    if (!search) return safeText;
+    const safeSearch = escapeHtml(search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return safeText.replace(new RegExp("(" + safeSearch + ")", "ig"), "<mark>$1</mark>");
+  }
+
+  const usesWord = (count) => (count === 1 ? "use" : "uses");
+
+  // 12 minutes ago -> "12 min ago"
+  function timeAgo(timeMs) {
+    if (!timeMs) return "never";
+    const seconds = Math.max(0, (Date.now() - timeMs) / 1000);
+    if (seconds < 60) return "just now";
+    if (seconds < 3600) return Math.floor(seconds / 60) + " min ago";
+    if (seconds < 86400) return Math.floor(seconds / 3600) + " h ago";
+    if (seconds < 86400 * 30) return Math.floor(seconds / 86400) + " d ago";
+    return new Date(timeMs).toLocaleDateString();
+  }
+
+  const fullDate = (timeMs) => (timeMs ? new Date(timeMs).toLocaleString() : "Never");
+
+  const lastUsedText = (skill) => (skill.lastUsed ? "Last used " + timeAgo(skill.lastUsed) : "Never used");
+
+  // Width of a usage bar, as a % of the most used skill.
+  function barWidth(count) {
+    const highest = Math.max(1, ...skills.map((skill) => skill.count));
+    return ((count / highest) * 100).toFixed(1) + "%";
+  }
+
+  const totalUses = () => skills.reduce((sum, skill) => sum + skill.count, 0);
+
+  // ===========================================================================
+  // 3. Skills folder: pick it once, remember it, read every SKILL.md
+  // ===========================================================================
+
+  // --- Remembering the folder (a folder can only be saved in IndexedDB) ---
+
+  function withSavedStore(mode, action) {
     return new Promise((resolve, reject) => {
-      const open = indexedDB.open("bob-skills", 1);
-      open.onupgradeneeded = () => open.result.createObjectStore("kv");
-      open.onerror = () => reject(open.error);
-      open.onsuccess = () => {
+      const request = indexedDB.open("bob-skills", 1);
+      request.onupgradeneeded = () => request.result.createObjectStore("kv");
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
         try {
-          const tx = open.result.transaction("kv", mode);
-          const req = fn(tx.objectStore("kv"));
-          tx.oncomplete = () => resolve(req && req.result);
-          tx.onerror = () => reject(tx.error);
-        } catch (err) { reject(err); }
+          const transaction = request.result.transaction("kv", mode);
+          const result = action(transaction.objectStore("kv"));
+          transaction.oncomplete = () => resolve(result && result.result);
+          transaction.onerror = () => reject(transaction.error);
+        } catch (error) {
+          reject(error);
+        }
       };
     });
   }
-  const savedFolder = () => idb("readonly", (s) => s.get("folder")).catch(() => null);
-  const saveFolder = (h) => idb("readwrite", (s) => s.put(h, "folder")).catch(() => {});
 
-  async function child(dir, name) {
-    try { return await dir.getDirectoryHandle(name); } catch { return null; }
-  }
-  // Accept the skills folder itself, the .bob folder, or the repo root.
-  async function skillsDir(dir) {
-    if (dir.name === "skills") return dir;
-    const direct = await child(dir, "skills");
-    if (direct) return direct;
-    const bob = await child(dir, ".bob");
-    return bob ? child(bob, "skills") : null;
+  const loadSavedFolder = () => withSavedStore("readonly", (store) => store.get("folder")).catch(() => null);
+  const saveFolder = (folder) => withSavedStore("readwrite", (store) => store.put(folder, "folder")).catch(() => {});
+
+  // --- Finding the skills folder inside what the user picked ---
+
+  async function subfolder(folder, name) {
+    try { return await folder.getDirectoryHandle(name); } catch { return null; }
   }
 
-  function frontmatter(text) {
-    const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-    const meta = {};
-    if (!m) return meta;
-    const lines = m[1].split(/\r?\n/);
+  // Accepts the skills folder itself, the .bob folder, or the repo root.
+  async function findSkillsFolder(picked) {
+    if (picked.name === "skills") return picked;
+    const skillsInside = await subfolder(picked, "skills");
+    if (skillsInside) return skillsInside;
+    const bobFolder = await subfolder(picked, ".bob");
+    return bobFolder ? subfolder(bobFolder, "skills") : null;
+  }
+
+  // --- Reading the SKILL.md files ---
+
+  // Reads the header at the top of a SKILL.md:
+  //   ---
+  //   name: compose-screen
+  //   description: ...
+  //   tags: [compose, ui]
+  //   ---
+  function readHeader(text) {
+    const header = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    const fields = {};
+    if (!header) return fields;
+
+    const lines = header[1].split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
-      const kv = lines[i].match(/^(\w[\w-]*):\s*(.*)$/);
-      if (!kv) continue;
-      let v = kv[2].trim();
-      if (v === "" || /^[>|][+-]?$/.test(v)) {                 // multi-line value (YAML > or |, or indented lines)
-        const more = [];
-        while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1])) more.push(lines[++i].trim());
-        if (more.length && more.every((l) => l.startsWith("- "))) { meta[kv[1]] = more.map((l) => l.slice(2).trim()); continue; }
-        v = more.join(" ");
+      const keyValue = lines[i].match(/^(\w[\w-]*):\s*(.*)$/);
+      if (!keyValue) continue;
+      const key = keyValue[1];
+      let value = keyValue[2].trim();
+
+      // Value continues on the next, indented lines (YAML "|" or ">" or a "- item" list).
+      if (value === "" || /^[>|][+-]?$/.test(value)) {
+        const nextLines = [];
+        while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1])) nextLines.push(lines[++i].trim());
+        const isList = nextLines.length && nextLines.every((line) => line.startsWith("- "));
+        if (isList) { fields[key] = nextLines.map((line) => line.slice(2).trim()); continue; }
+        value = nextLines.join(" ");
       }
-      if (v.startsWith("[") && v.endsWith("]")) v = v.slice(1, -1).split(",").map((x) => x.trim()).filter(Boolean);
-      else v = v.replace(/^["']|["']$/g, "");
-      meta[kv[1]] = v;
+
+      if (value.startsWith("[") && value.endsWith("]")) {
+        fields[key] = value.slice(1, -1).split(",").map((item) => item.trim()).filter(Boolean);   // [a, b]
+      } else {
+        fields[key] = value.replace(/^["']|["']$/g, "");                                            // "quoted"
+      }
     }
-    return meta;
+    return fields;
   }
 
-  async function readSkills(dir) {
-    const out = [];
-    for await (const [name, entry] of dir.entries()) {
+  function toTagList(tags) {
+    if (Array.isArray(tags)) return tags;
+    if (!tags) return [];
+    return String(tags).split(",").map((tag) => tag.trim()).filter(Boolean);
+  }
+
+  async function readSkillFile(folderEntry) {
+    try {
+      const file = await (await folderEntry.getFileHandle("SKILL.md")).getFile();
+      return await file.text();
+    } catch {
+      return null;
+    }
+  }
+
+  async function readAllSkills(folder) {
+    const found = [];
+    for await (const [folderName, entry] of folder.entries()) {
       if (entry.kind !== "directory") continue;
-      let text;
-      try { text = await (await (await entry.getFileHandle("SKILL.md")).getFile()).text(); } catch { continue; }
-      const m = frontmatter(text);
-      if (!m.description) continue;                             // Bob ignores skills without a description too
-      out.push({
-        id: name,
-        name: m.name || name,
-        description: m.description,
-        category: m.category || "Uncategorised",
-        tags: Array.isArray(m.tags) ? m.tags : m.tags ? String(m.tags).split(",").map((t) => t.trim()).filter(Boolean) : [],
-        path: "skills/" + name + "/SKILL.md",
+      const text = await readSkillFile(entry);
+      if (!text) continue;
+
+      const header = readHeader(text);
+      if (!header.description) continue;          // Bob ignores skills without a description too
+
+      found.push({
+        id: folderName,                           // the folder name is the skill's ID (same as in Firestore)
+        name: header.name || folderName,
+        description: header.description,
+        category: header.category || "Uncategorised",
+        tags: toTagList(header.tags),
+        path: "skills/" + folderName + "/SKILL.md",
         body: text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim(),
       });
     }
-    return out.sort((a, b) => a.id.localeCompare(b.id));
+    return found.sort((a, b) => a.id.localeCompare(b.id));
   }
 
-  async function load() {
-    if (!folder) return;
-    const data = await readSkills(folder);
-    const snapshot = JSON.stringify(data);
-    if (snapshot === lastSnapshot) return;                     // nothing changed since last check
-    lastSnapshot = snapshot;
-    base = data;
-    $("list").hidden = false;
-    $("empty").querySelector("p").textContent = "No skills match these filters.";
-    $("reset").hidden = false;
-    refresh();
+  // Re-reads the folder; redraws only if a SKILL.md changed.
+  async function reloadSkills() {
+    if (!skillsFolder) return;
+    const fresh = await readAllSkills(skillsFolder);
+    const snapshot = JSON.stringify(fresh);
+    if (snapshot === lastFilesSnapshot) return;
+    lastFilesSnapshot = snapshot;
+    skillsFromFiles = fresh;
+
+    byId("list").hidden = false;
+    byId("empty").querySelector("p").textContent = "No skills match these filters.";
+    byId("reset").hidden = false;
+    redrawEverything();
   }
 
-  // Shown until the folder is readable. kind: "pick" (first time), "allow" (browser wants a click), "unsupported".
-  function askForFolder(kind, note) {
-    const msg = {
-      pick: "Choose your <code>.bob/skills</code> folder once. The browser remembers it after that.",
-      allow: "Click to let this page read your skills again.",
-      unsupported: "This browser can't read folders. Open the dashboard in <b>Chrome</b> or <b>Edge</b>.",
-    }[kind];
-    $("source").textContent = "Skills folder not opened";
-    $("stats").innerHTML = "";
-    $("list").hidden = true; $("empty").hidden = false; $("reset").hidden = true;
-    $("empty").querySelector("p").innerHTML = msg + (note ? `<br><small>${esc(note)}</small>` : "") +
-      (kind === "unsupported" ? "" : `<br><button class="icon-btn" id="pickFolder" style="margin-top:14px">${kind === "pick" ? "Choose skills folder" : "Allow"}</button>`);
+  // --- Asking the user for the folder ---
+
+  const FOLDER_MESSAGES = {
+    pick: "Choose your <code>.bob/skills</code> folder once. The browser remembers it after that.",
+    allow: "Click to let this page read your skills again.",
+    unsupported: "This browser can't read folders. Open the dashboard in <b>Chrome</b> or <b>Edge</b>.",
+  };
+
+  // Shown until the folder can be read. reason: "pick" (first time), "allow" (browser wants a click), "unsupported".
+  function showFolderPrompt(reason, note) {
+    byId("source").textContent = "Skills folder not opened";
+    byId("stats").innerHTML = "";
+    byId("list").hidden = true;
+    byId("empty").hidden = false;
+    byId("reset").hidden = true;
+
+    const noteHtml = note ? `<br><small>${escapeHtml(note)}</small>` : "";
+    const buttonLabel = reason === "pick" ? "Choose skills folder" : "Allow";
+    const buttonHtml = reason === "unsupported" ? ""
+      : `<br><button class="icon-btn" id="pickFolder" style="margin-top:14px">${buttonLabel}</button>`;
+    byId("empty").querySelector("p").innerHTML = FOLDER_MESSAGES[reason] + noteHtml + buttonHtml;
   }
 
-  async function openFolder(handle) {
-    const dir = await skillsDir(handle);
-    if (!dir) return askForFolder("pick", `"${handle.name}" has no skills folder in it. Pick .bob/skills.`);
-    folder = dir;
-    saveFolder(handle);                                        // remember it for next time (never blocks loading)
-    lastSnapshot = "";
-    await load();
+  async function useFolder(picked) {
+    const folder = await findSkillsFolder(picked);
+    if (!folder) return showFolderPrompt("pick", `"${picked.name}" has no skills folder in it. Pick .bob/skills.`);
+    skillsFolder = folder;
+    saveFolder(picked);                // remember for next time (doesn't hold up loading)
+    lastFilesSnapshot = "";
+    await reloadSkills();
   }
 
-  async function pick() {
-    try { await openFolder(await window.showDirectoryPicker({ id: "bob-skills", mode: "read" })); }
-    catch (err) { if (err.name !== "AbortError") askForFolder("pick", err.message); }
-  }
-
-  async function allow(handle) {
+  async function askUserToPickFolder() {
     try {
-      if ((await handle.requestPermission({ mode: "read" })) === "granted") return openFolder(handle);
+      await useFolder(await window.showDirectoryPicker({ id: "bob-skills", mode: "read" }));
+    } catch (error) {
+      if (error.name !== "AbortError") showFolderPrompt("pick", error.message);   // AbortError = user cancelled
+    }
+  }
+
+  async function askUserToAllowFolder(savedFolder) {
+    try {
+      const answer = await savedFolder.requestPermission({ mode: "read" });
+      if (answer === "granted") return useFolder(savedFolder);
     } catch {}
-    askForFolder("pick", "Permission wasn't given. Pick the folder again.");
+    showFolderPrompt("pick", "Permission wasn't given. Pick the folder again.");
   }
 
-  async function connectFolder() {
-    if (!window.showDirectoryPicker) return askForFolder("unsupported");
-    const saved = await savedFolder();
-    if (!saved) return askForFolder("pick");
-    let perm = "prompt";
-    try { perm = await saved.queryPermission({ mode: "read" }); } catch {}
-    if (perm === "granted") {
-      try { return await openFolder(saved); } catch {}
-      return askForFolder("pick", "The saved folder can't be read any more (moved or deleted?). Pick it again.");
+  // On page open: use the remembered folder if we can, otherwise ask.
+  async function openRememberedFolder() {
+    if (!window.showDirectoryPicker) return showFolderPrompt("unsupported");
+
+    const savedFolder = await loadSavedFolder();
+    if (!savedFolder) return showFolderPrompt("pick");
+
+    let permission = "prompt";
+    try { permission = await savedFolder.queryPermission({ mode: "read" }); } catch {}
+
+    if (permission === "granted") {
+      try { return await useFolder(savedFolder); } catch {}
+      return showFolderPrompt("pick", "The saved folder can't be read any more (moved or deleted?). Pick it again.");
     }
-    askForFolder("allow");
-    $("empty").dataset.saved = "1";
+
+    // The browser wants a click before it lets us read the folder again.
+    showFolderPrompt("allow");
+    byId("empty").dataset.saved = "1";
   }
 
-  $("folderBtn").addEventListener("click", pick);
-  $("empty").addEventListener("click", async (e) => {
-    if (e.target.id !== "pickFolder") return;
-    const saved = $("empty").dataset.saved ? await savedFolder() : null;
-    delete $("empty").dataset.saved;
-    if (saved) allow(saved); else pick();
-  });
-
-  // Merge the skill list with the live Firestore numbers and redraw.
-  function refresh() {
-    if (!lastSnapshot) return;                                 // skill list not loaded yet
-    skills = base.map((s) => ({ ...s, count: usage[s.id]?.count || 0, lastUsed: usage[s.id]?.lastUsed || 0 }));
-    catColor = {};
-    [...new Set(skills.map((s) => s.category))].sort().forEach((c, i) => (catColor[c] = PALETTE[i % PALETTE.length]));
-    if (state.cat && !catColor[state.cat]) state.cat = "";
-    const status = {
-      connecting: "connecting to Firestore…",
-      live: "live counts from Firestore",
-      off: "Firestore not set up: fill in assets/data/skills-firebase-db-config.js",
-      error: "Firestore error: " + liveError,
-    }[live];
-    $("source").textContent = `${skills.length} skills · ${status}`;
-    $("source").title = status;
-    renderFilters();
-    render();
-    route();
+  async function onFolderPromptButton() {
+    const hasSavedFolder = byId("empty").dataset.saved;
+    delete byId("empty").dataset.saved;
+    const savedFolder = hasSavedFolder ? await loadSavedFolder() : null;
+    if (savedFolder) askUserToAllowFolder(savedFolder);
+    else askUserToPickFolder();
   }
 
-  function connectFirestore() {
-    const cfg = window.BOB_FIREBASE;
-    if (!window.firebase || !cfg || !cfg.apiKey || !cfg.projectId || /^YOUR_/.test(cfg.apiKey + cfg.projectId)) {
-      live = "off"; refresh(); return;
-    }
+  // ===========================================================================
+  // 4. Firestore: live usage counts
+  // ===========================================================================
+
+  function isFirebaseConfigured(config) {
+    return window.firebase && config && config.apiKey && config.projectId && !/^YOUR_/.test(config.apiKey + config.projectId);
+  }
+
+  function readUsage(snapshot) {
+    const usage = {};
+    snapshot.forEach((doc) => {
+      const data = doc.data({ serverTimestamps: "estimate" });
+      usage[doc.id] = {
+        count: Number(data.count) || 0,
+        lastUsed: data.lastUsedAt && data.lastUsedAt.toMillis ? data.lastUsedAt.toMillis() : 0,
+      };
+    });
+    return usage;
+  }
+
+  function setFirestoreStatus(status, error) {
+    firestoreStatus = status;
+    firestoreError = error || "";
+    redrawEverything();
+  }
+
+  function listenToFirestore() {
+    const config = window.BOB_FIREBASE;
+    if (!isFirebaseConfigured(config)) return setFirestoreStatus("off");
+
     try {
-      firebase.initializeApp(cfg).firestore().collection("skills").onSnapshot((snap) => {
-        const next = {};
-        snap.forEach((d) => {
-          const x = d.data({ serverTimestamps: "estimate" });
-          next[d.id] = { count: Number(x.count) || 0, lastUsed: x.lastUsedAt && x.lastUsedAt.toMillis ? x.lastUsedAt.toMillis() : 0 };
-        });
-        usage = next; live = "live"; refresh();
-      }, (err) => { live = "error"; liveError = err.message; refresh(); });
-    } catch (err) {
-      live = "error"; liveError = err.message; refresh();
+      const skillsCollection = firebase.initializeApp(config).firestore().collection("skills");
+      skillsCollection.onSnapshot(
+        (snapshot) => { usageFromFirestore = readUsage(snapshot); setFirestoreStatus("live"); },
+        (error) => setFirestoreStatus("error", error.message),
+      );
+    } catch (error) {
+      setFirestoreStatus("error", error.message);
     }
   }
 
-  async function start() {
-    connectFirestore();
-    setInterval(() => { if (!document.hidden && live === "live") render(); }, 60000);   // keep "x min ago" fresh
-    await connectFolder();
-    // Re-read the SKILL.md files every few seconds, so added or edited skills show up without reloading.
-    setInterval(() => { if (!document.hidden) load().catch(() => {}); }, POLL_MS);
-    document.addEventListener("visibilitychange", () => { if (!document.hidden) load().catch(() => {}); });
+  function firestoreStatusText() {
+    if (firestoreStatus === "connecting") return "connecting to Firestore…";
+    if (firestoreStatus === "live") return "live counts from Firestore";
+    if (firestoreStatus === "off") return "Firestore not set up: fill in assets/data/skills-firebase-db-config.js";
+    return "Firestore error: " + firestoreError;
   }
 
-  /* ---------- filtering ---------- */
-  function visible() {
-    const q = state.q.trim().toLowerCase();
-    const list = skills.filter((s) => {
-      if (state.cat && s.category !== state.cat) return false;
-      if (state.tag && !s.tags.includes(state.tag)) return false;
-      if (state.usage === "used" && !s.count) return false;
-      if (state.usage === "unused" && s.count) return false;
-      if (q && !`${s.name} ${s.description} ${s.category} ${s.tags.join(" ")}`.toLowerCase().includes(q)) return false;
-      return true;
-    });
-    const mul = state.dir === "asc" ? 1 : -1;
-    return list.sort((a, b) => {
-      const x = a[state.key], y = b[state.key];
-      const r = typeof x === "number" ? x - y : String(x).localeCompare(String(y));
-      return r !== 0 ? r * mul : b.count - a.count || a.name.localeCompare(b.name);
-    });
+  // ===========================================================================
+  // 5. Combine skills + usage, then redraw
+  // ===========================================================================
+
+  function assignCategoryColors() {
+    categoryColor = {};
+    const categories = [...new Set(skills.map((skill) => skill.category))].sort();
+    categories.forEach((category, i) => (categoryColor[category] = CATEGORY_COLORS[i % CATEGORY_COLORS.length]));
+    if (filters.category && !categoryColor[filters.category]) filters.category = "";
   }
 
-  /* ---------- list screen ---------- */
-  function renderFilters() {
-    const counts = {};
-    skills.forEach((s) => (counts[s.category] = (counts[s.category] || 0) + 1));
-    const cats = [["", "All skills", skills.length], ...Object.keys(counts).sort().map((c) => [c, c, counts[c]])];
-    $("cats").innerHTML = cats.map(([val, label, n]) => `
-      <button data-cat="${esc(val)}">
-        <span class="lbl">${val ? `<span class="dot" style="background:${catColor[val]}"></span>` : ""}${esc(label)}</span>
-        <span class="n">${n}</span>
+  function redrawEverything() {
+    if (!lastFilesSnapshot) return;            // skills not read yet
+
+    skills = skillsFromFiles.map((skill) => {
+      const usage = usageFromFirestore[skill.id] || {};
+      return { ...skill, count: usage.count || 0, lastUsed: usage.lastUsed || 0 };
+    });
+    assignCategoryColors();
+
+    const status = firestoreStatusText();
+    byId("source").textContent = `${skills.length} skills · ${status}`;
+    byId("source").title = status;
+
+    renderSidebar();
+    renderList();
+    showCurrentScreen();
+  }
+
+  // ===========================================================================
+  // 6. Filter and sort
+  // ===========================================================================
+
+  function matchesFilters(skill) {
+    const search = filters.search.trim().toLowerCase();
+    if (filters.category && skill.category !== filters.category) return false;
+    if (filters.tag && !skill.tags.includes(filters.tag)) return false;
+    if (filters.usage === "used" && !skill.count) return false;
+    if (filters.usage === "unused" && skill.count) return false;
+    if (search) {
+      const searchableText = `${skill.name} ${skill.description} ${skill.category} ${skill.tags.join(" ")}`.toLowerCase();
+      if (!searchableText.includes(search)) return false;
+    }
+    return true;
+  }
+
+  function compareSkills(a, b) {
+    const valueA = a[filters.sortBy];
+    const valueB = b[filters.sortBy];
+    const difference = typeof valueA === "number" ? valueA - valueB : String(valueA).localeCompare(String(valueB));
+    if (difference !== 0) return filters.sortDirection === "asc" ? difference : -difference;
+    return b.count - a.count || a.name.localeCompare(b.name);      // tie: most used, then A-Z
+  }
+
+  const visibleSkills = () => skills.filter(matchesFilters).sort(compareSkills);
+
+  function clearAllFilters() {
+    Object.assign(filters, { search: "", category: "", tag: "", usage: "all" });
+    byId("q").value = "";
+    renderList();
+  }
+
+  // ===========================================================================
+  // 7. Theme (light / dark)
+  // ===========================================================================
+
+  function loadTheme() {
+    try {
+      const saved = localStorage.getItem("bob-theme");
+      if (saved) document.documentElement.dataset.theme = saved;
+    } catch {}
+  }
+
+  function toggleTheme() {
+    const current = document.documentElement.dataset.theme;
+    const isDark = current ? current === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    const next = isDark ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem("bob-theme", next); } catch {}
+  }
+
+  // ===========================================================================
+  // 8. List screen
+  // ===========================================================================
+
+  const ICON_CLOSE = `<svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>`;
+  const ICON_CHEVRON = `<svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>`;
+
+  const categoryDot = (category) => `<span class="dot" style="background:${categoryColor[category]}"></span>`;
+
+  // --- Sidebar: categories and tags ---
+
+  function renderSidebar() {
+    const skillsPerCategory = {};
+    skills.forEach((skill) => (skillsPerCategory[skill.category] = (skillsPerCategory[skill.category] || 0) + 1));
+
+    const categoryButtons = [["", "All skills", skills.length]]
+      .concat(Object.keys(skillsPerCategory).sort().map((category) => [category, category, skillsPerCategory[category]]));
+
+    byId("cats").innerHTML = categoryButtons.map(([value, label, count]) => `
+      <button data-cat="${escapeHtml(value)}">
+        <span class="lbl">${value ? categoryDot(value) : ""}${escapeHtml(label)}</span>
+        <span class="n">${count}</span>
       </button>`).join("");
 
-    const tagCount = {};
-    skills.forEach((s) => s.tags.forEach((t) => (tagCount[t] = (tagCount[t] || 0) + 1)));
-    $("tags").innerHTML = Object.keys(tagCount)
-      .sort((a, b) => tagCount[b] - tagCount[a] || a.localeCompare(b))
-      .map((t) => `<button class="chip" data-tag="${esc(t)}">${esc(t)}</button>`).join("");
+    const skillsPerTag = {};
+    skills.forEach((skill) => skill.tags.forEach((tag) => (skillsPerTag[tag] = (skillsPerTag[tag] || 0) + 1)));
+    const tagsMostUsedFirst = Object.keys(skillsPerTag).sort((a, b) => skillsPerTag[b] - skillsPerTag[a] || a.localeCompare(b));
+
+    byId("tags").innerHTML = tagsMostUsedFirst
+      .map((tag) => `<button class="chip" data-tag="${escapeHtml(tag)}">${escapeHtml(tag)}</button>`).join("");
   }
 
-  function render() {
-    const list = visible();
-    const max = Math.max(1, ...skills.map((s) => s.count));
-    const q = state.q.trim();
+  // --- Highlight the buttons that match the current filters ---
 
-    document.querySelectorAll("#cats button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.cat === state.cat)));
-    document.querySelectorAll("#tags .chip").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.tag === state.tag)));
-    document.querySelectorAll("#usage button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.val === state.usage)));
-    $("sort").value = state.key;
-    $("dir").dataset.dir = state.dir;
+  function showSelectedFilters() {
+    const press = (selector, isOn) => document.querySelectorAll(selector).forEach((button) => button.setAttribute("aria-pressed", String(isOn(button))));
+    press("#cats button", (button) => button.dataset.cat === filters.category);
+    press("#tags .chip", (button) => button.dataset.tag === filters.tag);
+    press("#usage button", (button) => button.dataset.val === filters.usage);
+    byId("sort").value = filters.sortBy;
+    byId("dir").dataset.dir = filters.sortDirection;
+  }
 
-    // active filter pills
+  // --- "3 of 14  [UI x]  [#compose x]  Clear all" ---
+
+  function renderActiveFilterPills(shownCount) {
+    const search = filters.search.trim();
     const pills = [];
-    if (state.cat) pills.push(["cat", state.cat]);
-    if (state.tag) pills.push(["tag", "#" + state.tag]);
-    if (state.usage !== "all") pills.push(["usage", state.usage === "used" ? "Used" : "Never used"]);
-    if (q) pills.push(["q", `“${q}”`]);
-    $("active").hidden = !pills.length;
-    $("active").innerHTML = pills.length
-      ? `<span>${list.length} of ${skills.length}</span>` +
-        pills.map(([k, label]) => `<button class="pill" data-clear="${k}">${esc(label)}<svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>`).join("") +
-        `<button class="link" data-clear="all">Clear all</button>`
-      : "";
+    if (filters.category) pills.push(["category", filters.category]);
+    if (filters.tag) pills.push(["tag", "#" + filters.tag]);
+    if (filters.usage !== "all") pills.push(["usage", filters.usage === "used" ? "Used" : "Never used"]);
+    if (search) pills.push(["search", `“${search}”`]);
 
-    $("list").innerHTML = list.map((s, i) => `
-      <li class="item" data-id="${esc(s.id)}" tabindex="0" role="link" aria-label="Open ${esc(s.name)}">
-        <span class="rank${i < 3 && state.key === "count" && state.dir === "desc" && s.count ? " top" : ""}">${i + 1}</span>
+    byId("active").hidden = !pills.length;
+    if (!pills.length) { byId("active").innerHTML = ""; return; }
+
+    byId("active").innerHTML =
+      `<span>${shownCount} of ${skills.length}</span>` +
+      pills.map(([filter, label]) => `<button class="pill" data-clear="${filter}">${escapeHtml(label)}${ICON_CLOSE}</button>`).join("") +
+      `<button class="link" data-clear="all">Clear all</button>`;
+  }
+
+  // --- One row in the list ---
+
+  function skillRowHtml(skill, position) {
+    const search = filters.search.trim();
+    const isTopThree = position < 3 && filters.sortBy === "count" && filters.sortDirection === "desc" && skill.count;
+    const tagsHtml = skill.tags
+      .map((tag) => `<button class="tag${tag === filters.tag ? " on" : ""}" data-tag="${escapeHtml(tag)}">#${highlightSearch(tag, search)}</button>`)
+      .join("");
+
+    return `
+      <li class="item" data-id="${escapeHtml(skill.id)}" tabindex="0" role="link" aria-label="Open ${escapeHtml(skill.name)}">
+        <span class="rank${isTopThree ? " top" : ""}">${position + 1}</span>
         <div class="body">
           <div class="title">
-            <span class="name">${highlight(s.name, q)}</span>
-            <span class="badge"><span class="dot" style="background:${catColor[s.category]}"></span>${esc(s.category)}</span>
+            <span class="name">${highlightSearch(skill.name, search)}</span>
+            <span class="badge">${categoryDot(skill.category)}${escapeHtml(skill.category)}</span>
           </div>
-          <p class="desc">${highlight(s.description, q)}</p>
-          <div class="tags">${s.tags.map((t) => `<button class="tag${t === state.tag ? " on" : ""}" data-tag="${esc(t)}">#${highlight(t, q)}</button>`).join("")}</div>
+          <p class="desc">${highlightSearch(skill.description, search)}</p>
+          <div class="tags">${tagsHtml}</div>
         </div>
         <div class="usage">
-          <div class="top"><span class="count${s.count ? "" : " zero"}">${s.count}</span><span class="unit">${plural(s.count)}</span></div>
-          <div class="bar"><i style="width:${((s.count / max) * 100).toFixed(1)}%"></i></div>
-          <span class="last" title="${esc(fullDate(s.lastUsed))}">${s.lastUsed ? "Last used " + ago(s.lastUsed) : "Never used"}</span>
+          <div class="top"><span class="count${skill.count ? "" : " zero"}">${skill.count}</span><span class="unit">${usesWord(skill.count)}</span></div>
+          <div class="bar"><i style="width:${barWidth(skill.count)}"></i></div>
+          <span class="last" title="${escapeHtml(fullDate(skill.lastUsed))}">${lastUsedText(skill)}</span>
         </div>
-        <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
-      </li>`).join("");
-    $("list").hidden = !list.length;
-    $("empty").hidden = !!list.length;
+        ${ICON_CHEVRON}
+      </li>`;
+  }
 
-    const total = skills.reduce((a, s) => a + s.count, 0);
-    const used = skills.filter((s) => s.count).length;
-    const top = [...skills].sort((a, b) => b.count - a.count)[0];
-    const pct = skills.length ? Math.round((used / skills.length) * 100) : 0;
-    $("stats").innerHTML = `
+  // --- The 4 boxes at the top ---
+
+  function renderStats() {
+    const usedCount = skills.filter((skill) => skill.count).length;
+    const adoptionPercent = skills.length ? Math.round((usedCount / skills.length) * 100) : 0;
+    const mostUsed = [...skills].sort((a, b) => b.count - a.count)[0];
+    const hasMostUsed = mostUsed && mostUsed.count;
+
+    byId("stats").innerHTML = `
       <div class="stat"><div class="k">Skills</div><div class="v">${skills.length}</div></div>
-      <div class="stat"><div class="k">Total uses</div><div class="v">${total.toLocaleString()}</div></div>
-      <div class="stat"><div class="k">Adoption</div><div class="v">${used}<small> / ${skills.length} used</small></div>
-        <div class="meter"><i style="width:${pct}%"></i></div></div>
+      <div class="stat"><div class="k">Total uses</div><div class="v">${totalUses().toLocaleString()}</div></div>
+      <div class="stat"><div class="k">Adoption</div><div class="v">${usedCount}<small> / ${skills.length} used</small></div>
+        <div class="meter"><i style="width:${adoptionPercent}%"></i></div></div>
       <div class="stat"><div class="k">Most used</div>
-        <div class="v name" title="${top ? esc(top.name) : ""}">${top && top.count ? esc(top.name) : "—"}</div>
-        ${top && top.count ? `<div class="k" style="margin-top:4px">${top.count} ${plural(top.count)}</div>` : ""}</div>`;
+        <div class="v name" title="${mostUsed ? escapeHtml(mostUsed.name) : ""}">${hasMostUsed ? escapeHtml(mostUsed.name) : "—"}</div>
+        ${hasMostUsed ? `<div class="k" style="margin-top:4px">${mostUsed.count} ${usesWord(mostUsed.count)}</div>` : ""}</div>`;
   }
 
-  /* ---------- markdown (small, safe subset) ---------- */
-  function inline(t) {
-    return esc(t)
-      .replace(/`([^`]+)`/g, "<code>$1</code>")
-      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-      .replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>")
-      .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-  }
-  function markdown(src) {
-    const lines = String(src || "").replace(/\r/g, "").split("\n");
-    const out = []; let i = 0;
-    while (i < lines.length) {
-      const line = lines[i];
-      if (/^```/.test(line)) {
-        const lang = line.slice(3).trim(); const buf = []; i++;
-        while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]);
-        i++; out.push(`<pre${lang ? ` data-lang="${esc(lang)}"` : ""}><code>${esc(buf.join("\n"))}</code></pre>`); continue;
-      }
-      let m;
-      if ((m = line.match(/^(#{1,4})\s+(.*)$/))) { const n = Math.min(m[1].length + 1, 5); out.push(`<h${n}>${inline(m[2])}</h${n}>`); i++; continue; }
-      if (/^\s*([-*_])\s*\1\s*\1[\s\1]*$/.test(line)) { out.push("<hr>"); i++; continue; }
-      if (/^>\s?/.test(line)) { const buf = []; while (i < lines.length && /^>\s?/.test(lines[i])) buf.push(lines[i++].replace(/^>\s?/, "")); out.push(`<blockquote>${inline(buf.join(" "))}</blockquote>`); continue; }
-      if (/^\s*([-*+]|\d+[.)])\s+/.test(line)) {
-        const ordered = /^\s*\d+[.)]/.test(line); const items = [];
-        while (i < lines.length && /^\s*([-*+]|\d+[.)])\s+/.test(lines[i])) {
-          let item = lines[i++].replace(/^\s*([-*+]|\d+[.)])\s+/, "");
-          while (i < lines.length && /^\s{2,}\S/.test(lines[i]) && !/^\s*([-*+]|\d+[.)])\s+/.test(lines[i])) item += " " + lines[i++].trim();
-          const task = item.match(/^\[( |x)\]\s+(.*)$/i);
-          items.push(task ? `<li class="task"><span class="box${task[1].trim() ? " done" : ""}"></span>${inline(task[2])}</li>` : `<li>${inline(item)}</li>`);
-        }
-        out.push(`<${ordered ? "ol" : "ul"}>${items.join("")}</${ordered ? "ol" : "ul"}>`); continue;
-      }
-      if (/^\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
-        const cells = (l) => l.trim().slice(1, -1).split("|").map((c) => c.trim());
-        const head = cells(line); i += 2; const rows = [];
-        while (i < lines.length && /^\|.*\|\s*$/.test(lines[i])) rows.push(cells(lines[i++]));
-        out.push(`<div class="tbl"><table><thead><tr>${head.map((h) => `<th>${inline(h)}</th>`).join("")}</tr></thead><tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`); continue;
-      }
-      if (!line.trim()) { i++; continue; }
-      const buf = [];
-      while (i < lines.length && lines[i].trim() && !/^(#{1,4}\s|```|>|\s*([-*+]|\d+[.)])\s+|\|)/.test(lines[i])) buf.push(lines[i++]);
-      if (!buf.length) buf.push(lines[i++]);
-      out.push(`<p>${inline(buf.join(" "))}</p>`);
-    }
-    return out.join("\n");
+  function renderList() {
+    const shown = visibleSkills();
+
+    showSelectedFilters();
+    renderActiveFilterPills(shown.length);
+    byId("list").innerHTML = shown.map(skillRowHtml).join("");
+    byId("list").hidden = !shown.length;
+    byId("empty").hidden = !!shown.length;
+    renderStats();
   }
 
+  // ===========================================================================
+  // 9. Detail screen (#/skill/<folder-name>)
+  // ===========================================================================
 
-  /* ---------- detail screen ---------- */
-  let listScroll = 0;
-  let cameFromList = false;
-  function open(id) { listScroll = window.scrollY; cameFromList = true; location.hash = "#/skill/" + encodeURIComponent(id); }
-  function back() { if (cameFromList) history.back(); else location.hash = ""; }
+  let listScrollPosition = 0;
+  let openedFromList = false;
 
-  function route() {
-    const m = location.hash.match(/^#\/skill\/(.+)$/);
-    const skill = m && skills.find((s) => s.id === decodeURIComponent(m[1]));
+  function openSkill(id) {
+    listScrollPosition = window.scrollY;
+    openedFromList = true;
+    location.hash = "#/skill/" + encodeURIComponent(id);
+  }
+
+  function goBackToList() {
+    if (openedFromList) history.back();
+    else location.hash = "";
+  }
+
+  // Shows the list or a skill, depending on the address (#/skill/...).
+  function showCurrentScreen() {
+    const match = location.hash.match(/^#\/skill\/(.+)$/);
+    const skill = match && skills.find((s) => s.id === decodeURIComponent(match[1]));
+
     if (skill) {
       renderDetail(skill);
-      if ($("detailView").hidden) window.scrollTo(0, 0);
-      $("listView").hidden = true; $("detailView").hidden = false;
+      if (byId("detailView").hidden) window.scrollTo(0, 0);
+      byId("listView").hidden = true;
+      byId("detailView").hidden = false;
       document.title = skill.name + " · Bob Skills";
-    } else {
-      const wasDetail = !$("detailView").hidden;
-      $("detailView").hidden = true; $("listView").hidden = false;
-      document.title = "Bob Skills";
-      if (wasDetail) window.scrollTo(0, listScroll);
-      cameFromList = false;
+      return;
     }
+
+    const wasOnDetail = !byId("detailView").hidden;
+    byId("detailView").hidden = true;
+    byId("listView").hidden = false;
+    document.title = "Bob Skills";
+    if (wasOnDetail) window.scrollTo(0, listScrollPosition);
+    openedFromList = false;
   }
 
-  function renderDetail(s) {
-    const ranked = [...skills].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
-    const rank = ranked.findIndex((x) => x.id === s.id) + 1;
-    const max = Math.max(1, ...skills.map((x) => x.count));
-    const total = skills.reduce((a, x) => a + x.count, 0);
-    const share = total ? Math.round((s.count / total) * 100) : 0;
-    const order = visible();
-    const pos = order.findIndex((x) => x.id === s.id);
-    const prev = pos > 0 ? order[pos - 1] : null;
-    const next = pos >= 0 && pos < order.length - 1 ? order[pos + 1] : null;
-    const body = s.body ? markdown(s.body) : `<p class="muted">This SKILL.md has no content beyond its header.</p>`;
+  function pagerButton(skill, direction) {
+    const icon = direction === "Previous" ? "m15 18-6-6 6-6" : "m9 6 6 6-6 6";
+    const attributes = skill ? `title="${direction}: ${escapeHtml(skill.name)}"` : "disabled";
+    return `<button class="icon-btn square" data-go="${skill ? escapeHtml(skill.id) : ""}" ${attributes} aria-label="${direction} skill"><svg viewBox="0 0 24 24"><path d="${icon}"/></svg></button>`;
+  }
 
-    $("detailView").innerHTML = `
+  function renderDetail(skill) {
+    // Rank among all skills
+    const ranked = [...skills].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+    const rank = ranked.findIndex((s) => s.id === skill.id) + 1;
+    const total = totalUses();
+    const sharePercent = total ? Math.round((skill.count / total) * 100) : 0;
+
+    // Previous / next, in the order the list currently shows
+    const order = visibleSkills();
+    const position = order.findIndex((s) => s.id === skill.id);
+    const previous = position > 0 ? order[position - 1] : null;
+    const next = position >= 0 && position < order.length - 1 ? order[position + 1] : null;
+
+    const bodyHtml = skill.body ? markdownToHtml(skill.body) : `<p class="muted">This SKILL.md has no content beyond its header.</p>`;
+    const tagsHtml = skill.tags.length
+      ? `<div class="d-tags">${skill.tags.map((tag) => `<button class="chip" data-filter-tag="${escapeHtml(tag)}" title="Show all skills tagged ${escapeHtml(tag)}">#${escapeHtml(tag)}</button>`).join("")}</div>`
+      : "";
+
+    byId("detailView").innerHTML = `
       <nav class="crumbs">
         <button class="back" data-act="back"><svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg>All skills</button>
         <div class="pager">
-          <button class="icon-btn square" data-go="${prev ? esc(prev.id) : ""}" ${prev ? `title="Previous: ${esc(prev.name)}"` : "disabled"} aria-label="Previous skill"><svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg></button>
-          <span class="pos">${pos >= 0 ? `${pos + 1} / ${order.length}` : ""}</span>
-          <button class="icon-btn square" data-go="${next ? esc(next.id) : ""}" ${next ? `title="Next: ${esc(next.name)}"` : "disabled"} aria-label="Next skill"><svg viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg></button>
+          ${pagerButton(previous, "Previous")}
+          <span class="pos">${position >= 0 ? `${position + 1} / ${order.length}` : ""}</span>
+          ${pagerButton(next, "Next")}
         </div>
       </nav>
 
       <header class="d-head">
-        <span class="badge lg"><span class="dot" style="background:${catColor[s.category]}"></span>${esc(s.category)}</span>
-        <h2 class="d-title">${esc(s.name)}</h2>
-        <p class="d-desc">${esc(s.description)}</p>
-        ${s.tags.length ? `<div class="d-tags">${s.tags.map((t) => `<button class="chip" data-filter-tag="${esc(t)}" title="Show all skills tagged ${esc(t)}">#${esc(t)}</button>`).join("")}</div>` : ""}
+        <span class="badge lg">${categoryDot(skill.category)}${escapeHtml(skill.category)}</span>
+        <h2 class="d-title">${escapeHtml(skill.name)}</h2>
+        <p class="d-desc">${escapeHtml(skill.description)}</p>
+        ${tagsHtml}
       </header>
 
       <div class="d-grid">
         <article class="doc">
           <div class="doc-bar">
-            <span><svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z"/><path d="M14 3v5h5"/></svg>${esc(s.path)}</span>
-            <button class="link" data-copy="${esc(s.body || "")}">Copy</button>
+            <span><svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z"/><path d="M14 3v5h5"/></svg>${escapeHtml(skill.path)}</span>
+            <button class="link" data-copy="${escapeHtml(skill.body || "")}">Copy</button>
           </div>
-          <div class="md">${body}</div>
+          <div class="md">${bodyHtml}</div>
         </article>
 
         <aside class="d-side">
           <div class="card">
             <div class="k">Times used</div>
-            <div class="big">${s.count}</div>
-            <div class="bar"><i style="width:${((s.count / max) * 100).toFixed(1)}%"></i></div>
+            <div class="big">${skill.count}</div>
+            <div class="bar"><i style="width:${barWidth(skill.count)}"></i></div>
             <dl>
               <div><dt>Rank</dt><dd>#${rank} of ${skills.length}</dd></div>
-              <div><dt>Share of all uses</dt><dd>${share}%</dd></div>
-              <div><dt>Last used</dt><dd title="${esc(fullDate(s.lastUsed))}">${s.lastUsed ? ago(s.lastUsed) : "Never"}</dd></div>
+              <div><dt>Share of all uses</dt><dd>${sharePercent}%</dd></div>
+              <div><dt>Last used</dt><dd title="${escapeHtml(fullDate(skill.lastUsed))}">${skill.lastUsed ? timeAgo(skill.lastUsed) : "Never"}</dd></div>
             </dl>
           </div>
         </aside>
       </div>`;
   }
 
-  /* ---------- events ---------- */
-  $("q").addEventListener("input", (e) => { state.q = e.target.value; render(); });
-  $("cats").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) { state.cat = b.dataset.cat; render(); } });
-  const toggleTag = (e) => {
-    const b = e.target.closest("[data-tag]"); if (!b) return;
-    state.tag = state.tag === b.dataset.tag ? "" : b.dataset.tag; render();
-  };
-  $("tags").addEventListener("click", toggleTag);
-  $("list").addEventListener("click", (e) => {
-    if (e.target.closest("[data-tag]")) return toggleTag(e);
-    const li = e.target.closest(".item"); if (li) open(li.dataset.id);
-  });
-  $("list").addEventListener("keydown", (e) => {
-    const li = e.target.closest(".item");
-    if (li && (e.key === "Enter" || e.key === " ") && !e.target.closest("[data-tag]")) { e.preventDefault(); open(li.dataset.id); }
-  });
-  $("usage").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) { state.usage = b.dataset.val; render(); } });
-  $("sort").addEventListener("change", (e) => {
-    state.key = e.target.value;
-    state.dir = state.key === "count" || state.key === "lastUsed" ? "desc" : "asc";
-    render();
-  });
-  $("dir").addEventListener("click", () => { state.dir = state.dir === "asc" ? "desc" : "asc"; render(); });
-  function clearAll() { Object.assign(state, { q: "", cat: "", tag: "", usage: "all" }); $("q").value = ""; render(); }
-  $("active").addEventListener("click", (e) => {
-    const b = e.target.closest("[data-clear]"); if (!b) return;
-    if (b.dataset.clear === "all") return clearAll();
-    if (b.dataset.clear === "q") $("q").value = "";
-    state[b.dataset.clear] = DEFAULTS[b.dataset.clear]; render();
-  });
-  $("reset").addEventListener("click", clearAll);
+  // ===========================================================================
+  // 10. Markdown -> HTML (a small, safe subset, for showing SKILL.md)
+  // ===========================================================================
 
-  $("detailView").addEventListener("click", async (e) => {
-    const t = e.target.closest("button"); if (!t) return;
-    if (t.dataset.act === "back") return back();
-    if (t.dataset.go) return location.replace("#/skill/" + encodeURIComponent(t.dataset.go));
-    if (t.dataset.filterTag !== undefined) { state.tag = t.dataset.filterTag; location.hash = ""; render(); return; }
-    if (t.dataset.copy !== undefined) {
-      try { await navigator.clipboard.writeText(t.dataset.copy); t.textContent = "Copied"; } catch { t.textContent = "Copy failed"; }
-      setTimeout(() => (t.textContent = "Copy"), 1200);
+  // **bold**, *italic*, `code`, [link](https://...)
+  function inlineMarkdown(text) {
+    return escapeHtml(text)
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>")
+      .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  }
+
+  const IS_LIST_ITEM = /^\s*([-*+]|\d+[.)])\s+/;
+  const IS_TABLE_ROW = /^\|.*\|\s*$/;
+  const IS_TABLE_DIVIDER = /^\|[\s:|-]+\|\s*$/;
+  const STARTS_ANOTHER_BLOCK = /^(#{1,4}\s|```|>|\s*([-*+]|\d+[.)])\s+|\|)/;
+
+  function markdownToHtml(source) {
+    const lines = String(source || "").replace(/\r/g, "").split("\n");
+    const html = [];
+    let i = 0;
+
+    while (i < lines.length) {
+      const line = lines[i];
+      let match;
+
+      // ```code block```
+      if (/^```/.test(line)) {
+        const language = line.slice(3).trim();
+        const code = [];
+        i++;
+        while (i < lines.length && !/^```/.test(lines[i])) code.push(lines[i++]);
+        i++;
+        html.push(`<pre${language ? ` data-lang="${escapeHtml(language)}"` : ""}><code>${escapeHtml(code.join("\n"))}</code></pre>`);
+        continue;
+      }
+
+      // # Heading
+      if ((match = line.match(/^(#{1,4})\s+(.*)$/))) {
+        const level = Math.min(match[1].length + 1, 5);
+        html.push(`<h${level}>${inlineMarkdown(match[2])}</h${level}>`);
+        i++;
+        continue;
+      }
+
+      // --- line
+      if (/^\s*([-*_])\s*\1\s*\1[\s\1]*$/.test(line)) {
+        html.push("<hr>");
+        i++;
+        continue;
+      }
+
+      // > quote
+      if (/^>\s?/.test(line)) {
+        const quote = [];
+        while (i < lines.length && /^>\s?/.test(lines[i])) quote.push(lines[i++].replace(/^>\s?/, ""));
+        html.push(`<blockquote>${inlineMarkdown(quote.join(" "))}</blockquote>`);
+        continue;
+      }
+
+      // - list / 1. list / - [x] task
+      if (IS_LIST_ITEM.test(line)) {
+        const isNumbered = /^\s*\d+[.)]/.test(line);
+        const items = [];
+        while (i < lines.length && IS_LIST_ITEM.test(lines[i])) {
+          let item = lines[i++].replace(IS_LIST_ITEM, "");
+          while (i < lines.length && /^\s{2,}\S/.test(lines[i]) && !IS_LIST_ITEM.test(lines[i])) item += " " + lines[i++].trim();
+          const task = item.match(/^\[( |x)\]\s+(.*)$/i);
+          items.push(task
+            ? `<li class="task"><span class="box${task[1].trim() ? " done" : ""}"></span>${inlineMarkdown(task[2])}</li>`
+            : `<li>${inlineMarkdown(item)}</li>`);
+        }
+        const tag = isNumbered ? "ol" : "ul";
+        html.push(`<${tag}>${items.join("")}</${tag}>`);
+        continue;
+      }
+
+      // | table |
+      if (IS_TABLE_ROW.test(line) && i + 1 < lines.length && IS_TABLE_DIVIDER.test(lines[i + 1])) {
+        const cells = (row) => row.trim().slice(1, -1).split("|").map((cell) => cell.trim());
+        const headings = cells(line);
+        const rows = [];
+        i += 2;
+        while (i < lines.length && IS_TABLE_ROW.test(lines[i])) rows.push(cells(lines[i++]));
+        const headHtml = headings.map((h) => `<th>${inlineMarkdown(h)}</th>`).join("");
+        const rowsHtml = rows.map((row) => `<tr>${row.map((cell) => `<td>${inlineMarkdown(cell)}</td>`).join("")}</tr>`).join("");
+        html.push(`<div class="tbl"><table><thead><tr>${headHtml}</tr></thead><tbody>${rowsHtml}</tbody></table></div>`);
+        continue;
+      }
+
+      // empty line
+      if (!line.trim()) { i++; continue; }
+
+      // paragraph: joins lines until an empty line or another block starts
+      const paragraph = [];
+      while (i < lines.length && lines[i].trim() && !STARTS_ANOTHER_BLOCK.test(lines[i])) paragraph.push(lines[i++]);
+      if (!paragraph.length) paragraph.push(lines[i++]);
+      html.push(`<p>${inlineMarkdown(paragraph.join(" "))}</p>`);
     }
-  });
-  window.addEventListener("hashchange", route);
 
-  document.addEventListener("keydown", (e) => {
-    const typing = /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName);
-    if (e.key === "Escape" && !$("detailView").hidden) return back();
-    if (e.key === "/" && !typing) { e.preventDefault(); $("q").focus(); }
-    if (e.key === "Escape" && document.activeElement === $("q")) { $("q").value = ""; state.q = ""; render(); $("q").blur(); }
-  });
+    return html.join("\n");
+  }
+
+  // ===========================================================================
+  // 11. Clicks and keys
+  // ===========================================================================
+
+  function toggleTagFilter(event) {
+    const button = event.target.closest("[data-tag]");
+    if (!button) return;
+    filters.tag = filters.tag === button.dataset.tag ? "" : button.dataset.tag;
+    renderList();
+  }
+
+  function onSortChange(event) {
+    filters.sortBy = event.target.value;
+    const newestOrBiggestFirst = filters.sortBy === "count" || filters.sortBy === "lastUsed";
+    filters.sortDirection = newestOrBiggestFirst ? "desc" : "asc";
+    renderList();
+  }
+
+  function onPillClick(event) {
+    const button = event.target.closest("[data-clear]");
+    if (!button) return;
+    const filter = button.dataset.clear;
+    if (filter === "all") return clearAllFilters();
+    if (filter === "search") byId("q").value = "";
+    filters[filter] = DEFAULT_FILTERS[filter];
+    renderList();
+  }
+
+  function onListClick(event) {
+    if (event.target.closest("[data-tag]")) return toggleTagFilter(event);
+    const row = event.target.closest(".item");
+    if (row) openSkill(row.dataset.id);
+  }
+
+  function onListKey(event) {
+    const row = event.target.closest(".item");
+    const isOpenKey = event.key === "Enter" || event.key === " ";
+    if (row && isOpenKey && !event.target.closest("[data-tag]")) {
+      event.preventDefault();
+      openSkill(row.dataset.id);
+    }
+  }
+
+  async function onDetailClick(event) {
+    const button = event.target.closest("button");
+    if (!button) return;
+
+    if (button.dataset.act === "back") return goBackToList();
+    if (button.dataset.go) return location.replace("#/skill/" + encodeURIComponent(button.dataset.go));
+
+    if (button.dataset.filterTag !== undefined) {
+      filters.tag = button.dataset.filterTag;
+      location.hash = "";
+      renderList();
+      return;
+    }
+
+    if (button.dataset.copy !== undefined) {
+      try {
+        await navigator.clipboard.writeText(button.dataset.copy);
+        button.textContent = "Copied";
+      } catch {
+        button.textContent = "Copy failed";
+      }
+      setTimeout(() => (button.textContent = "Copy"), 1200);
+    }
+  }
+
+  // "/" focuses search, Esc clears search or goes back.
+  function onKeyboardShortcut(event) {
+    const isTyping = /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName);
+    const searchBox = byId("q");
+
+    if (event.key === "Escape" && !byId("detailView").hidden) return goBackToList();
+    if (event.key === "/" && !isTyping) {
+      event.preventDefault();
+      searchBox.focus();
+    }
+    if (event.key === "Escape" && document.activeElement === searchBox) {
+      searchBox.value = "";
+      filters.search = "";
+      renderList();
+      searchBox.blur();
+    }
+  }
+
+  function connectEvents() {
+    byId("theme").addEventListener("click", toggleTheme);
+    byId("folderBtn").addEventListener("click", askUserToPickFolder);
+    byId("empty").addEventListener("click", (event) => { if (event.target.id === "pickFolder") onFolderPromptButton(); });
+
+    byId("q").addEventListener("input", (event) => { filters.search = event.target.value; renderList(); });
+    byId("cats").addEventListener("click", (event) => {
+      const button = event.target.closest("button");
+      if (button) { filters.category = button.dataset.cat; renderList(); }
+    });
+    byId("tags").addEventListener("click", toggleTagFilter);
+    byId("usage").addEventListener("click", (event) => {
+      const button = event.target.closest("button");
+      if (button) { filters.usage = button.dataset.val; renderList(); }
+    });
+    byId("sort").addEventListener("change", onSortChange);
+    byId("dir").addEventListener("click", () => {
+      filters.sortDirection = filters.sortDirection === "asc" ? "desc" : "asc";
+      renderList();
+    });
+    byId("active").addEventListener("click", onPillClick);
+    byId("reset").addEventListener("click", clearAllFilters);
+
+    byId("list").addEventListener("click", onListClick);
+    byId("list").addEventListener("keydown", onListKey);
+    byId("detailView").addEventListener("click", onDetailClick);
+
+    window.addEventListener("hashchange", showCurrentScreen);
+    document.addEventListener("keydown", onKeyboardShortcut);
+  }
+
+  // ===========================================================================
+  // 12. Start
+  // ===========================================================================
+
+  async function start() {
+    loadTheme();
+    connectEvents();
+    listenToFirestore();
+    await openRememberedFolder();
+
+    const reloadIfVisible = () => { if (!document.hidden) reloadSkills().catch(() => {}); };
+    setInterval(reloadIfVisible, RE_READ_SKILLS_EVERY_MS);
+    document.addEventListener("visibilitychange", reloadIfVisible);
+    setInterval(() => { if (!document.hidden && firestoreStatus === "live") renderList(); }, REFRESH_TIMES_EVERY_MS);
+  }
 
   start();
 })();
