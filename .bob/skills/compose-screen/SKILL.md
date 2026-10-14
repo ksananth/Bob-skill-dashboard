@@ -1,5 +1,5 @@
 ---
-name: compose-screen
+name: compose-screen1
 description: Scaffold a new Jetpack Compose screen with state hoisting, preview and ViewModel wiring.
 category: UI
 tags: [compose, ui, kotlin]
