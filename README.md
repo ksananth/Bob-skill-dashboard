@@ -30,16 +30,6 @@ service cloud.firestore {
 }
 ```
 
-What they allow, for each document `skills/<skill-folder>`:
-
-| Action | Allowed? | Rule |
-|---|---|---|
-| **Read** | Anyone | The dashboard can show the counts. |
-| **Create** (first use of a skill) | Only if it starts at 1 | Only the fields `count` and `lastUsedAt`; `count` must be `1`; `lastUsedAt` must be the server's time. |
-| **Update** (every next use) | Only +1 | `count` must be exactly the old value + 1; `lastUsedAt` must be the server's time; no other fields. |
-| **Delete** | No one | Counts can't be wiped from the app. Delete a document by hand in the Firebase console to reset a skill. |
-
-So the public `apiKey` is safe: anyone who has it can still only add 1 use at a time with the real time. They can't set a fake count (for example 999), backdate `lastUsedAt`, add other fields, or delete data.
 
 ## Opening the dashboard
 
