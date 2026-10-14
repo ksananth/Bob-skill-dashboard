@@ -1,0 +1,17 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // One document per skill: { count, lastUsedAt }.
+    // Anyone can read. A write can only add 1 to count and set lastUsedAt to the server's "now".
+    match /skills/{skill} {
+      allow read: if true;
+      allow create: if request.resource.data.keys().hasOnly(['count', 'lastUsedAt'])
+                    && request.resource.data.count == 1
+                    && request.resource.data.lastUsedAt == request.time;
+      allow update: if request.resource.data.keys().hasOnly(['count', 'lastUsedAt'])
+                    && request.resource.data.count == resource.data.count + 1
+                    && request.resource.data.lastUsedAt == request.time;
+      allow delete: if false;
+    }
+  }
+}

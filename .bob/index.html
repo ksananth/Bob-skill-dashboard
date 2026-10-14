@@ -63,6 +63,7 @@
           <div class="sort">
             <select id="sort" aria-label="Sort by">
               <option value="count">Most used</option>
+              <option value="lastUsed">Recently used</option>
               <option value="name">Name</option>
               <option value="category">Category</option>
             </select>
@@ -84,9 +85,9 @@
 
         <details class="help">
           <summary>How it updates</summary>
-          <p>Each time Bob activates a skill, the hook in <code>.bob/settings.json</code> adds 1 to that skill in <code>assets/data/skills-usage.json</code>.</p>
-          <p>A small watcher (started when a Bob session begins) rebuilds <code>assets/data/skills-data.js</code> whenever a skill is added, edited or removed in <code>skills/</code>, or the counts change. This page re-reads it every few seconds.</p>
-          <p>Not updating? Run <code>node .bob/assets/tools/skills.js watch</code>. To reset counts, set <code>skills-usage.json</code> to <code>{}</code>.</p>
+          <p>Each time Bob activates a skill, the hook in <code>.bob/settings.json</code> adds 1 to that skill's count in Firestore and sets its last-used time. This page gets the new numbers instantly.</p>
+          <p>A small watcher (started when a Bob session begins) rebuilds <code>assets/data/skills-data.js</code> whenever a skill is added, edited or removed in <code>skills/</code>. This page re-reads it every few seconds.</p>
+          <p>Counts not arriving? Run <code>node .bob/assets/tools/skills.js log &lt;skill-name&gt;</code> to test, and check <code>assets/data/firestore-errors.log</code>. To reset a count, delete that skill's document in the Firebase console.</p>
         </details>
       </main>
     </div>
@@ -96,6 +97,9 @@
     <section id="detailView" class="detail" hidden aria-live="polite"></section>
   </div>
 
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+  <script src="assets/data/firebase-config.js"></script>
   <script src="assets/js/app.js"></script>
 </body>
 </html>

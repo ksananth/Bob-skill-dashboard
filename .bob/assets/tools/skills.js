@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 // Bob skills — one script, run by the hooks in .bob/settings.json.
 //
-//   node .bob/assets/tools/skills.js log     After each use_skill: adds 1 to that skill in skills-usage.json, then builds.
-//   node .bob/assets/tools/skills.js start   On session start: builds, and starts the watcher in the background if needed.
-//   node .bob/assets/tools/skills.js build   Rebuilds assets/data/skills-data.js now (also run on every prompt).
-//   node .bob/assets/tools/skills.js watch   Watches skills/ and skills-usage.json and rebuilds on any change.
+//   node .bob/assets/tools/skills.js log           After each use_skill: adds 1 to that skill in Firestore and sets its last-used time.
+//   node .bob/assets/tools/skills.js log <skill>   Same, by hand (handy to test the Firestore setup).
+//   node .bob/assets/tools/skills.js start         On session start: builds, and starts the watcher in the background if needed.
+//   node .bob/assets/tools/skills.js build         Rebuilds assets/data/skills-data.js now (also run on every prompt).
+//   node .bob/assets/tools/skills.js watch         Watches skills/ and rebuilds on any change.
 //
-// skills-usage.json  ->  { "<skill-name>": <count> }   the counts (edit or set to {} to reset)
-// skills-data.js     ->  the same counts + each SKILL.md, as a script, because browsers won't let a
-//                        double-clicked index.html read .json files or list folders, but will load .js files.
+// Firestore          ->  skills/<skill-name> = { count, lastUsedAt }   the usage numbers, shared by everyone
+// skills-data.js     ->  the list of skills (each SKILL.md), as a script, because browsers won't let a
+//                        double-clicked index.html list folders, but will load .js files.
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -22,9 +23,10 @@ const SKILL_DIRS = [...new Set([
   path.join(process.cwd(), ".bob", "skills"),        // hooks run from the repo root
   path.join(os.homedir(), ".bob", "skills"),         // Bob's global skills
 ])];
-const USAGE_FILE = path.join(BOB, "assets", "data", "skills-usage.json");
 const DATA_FILE = path.join(BOB, "assets", "data", "skills-data.js");
 const PID_FILE = path.join(BOB, "assets", "data", "watcher.pid");
+const CONFIG_FILE = path.join(BOB, "assets", "data", "firebase-config.js");
+const ERROR_LOG = path.join(BOB, "assets", "data", "firestore-errors.log");
 
 /* ---------- skills ---------- */
 function frontmatter(text) {
@@ -77,40 +79,87 @@ function listSkills() {
   return out.sort((a, b) => a.id.localeCompare(b.id));
 }
 
+/* ---------- Firestore ---------- */
+function firebaseConfig() {
+  try {
+    delete require.cache[CONFIG_FILE];
+    const c = require(CONFIG_FILE);
+    if (c && c.apiKey && c.projectId && !/^YOUR_/.test(c.apiKey + c.projectId)) return c;
+  } catch {}
+  throw new Error("Firebase isn't set up yet: fill in " + path.relative(process.cwd(), CONFIG_FILE));
+}
+
+// One atomic write: count + 1 and lastUsedAt = the server's time. Creates the document on first use.
+// Uses the REST API with Node's built-in fetch, so there's nothing to npm install.
+async function recordUse(id) {
+  const c = firebaseConfig();
+  const db = `projects/${c.projectId}/databases/(default)/documents`;
+  const res = await fetch(`https://firestore.googleapis.com/v1/${db}:commit?key=${encodeURIComponent(c.apiKey)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      writes: [{
+        transform: {
+          document: `${db}/skills/${id}`,
+          fieldTransforms: [
+            { fieldPath: "count", increment: { integerValue: "1" } },
+            { fieldPath: "lastUsedAt", setToServerValue: "REQUEST_TIME" },
+          ],
+        },
+      }],
+    }),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`Firestore said ${res.status}: ${(await res.text()).slice(0, 300)}`);
+}
+
+function logError(err) {
+  try { fs.appendFileSync(ERROR_LOG, `${new Date().toISOString()} ${err.message || err}\n`); } catch {}
+}
+
 /* ---------- log (PostToolUse hook on use_skill) ---------- */
-function log() {
+function skillFromInput(raw) {
+  const input = (JSON.parse(raw || "{}").input) || {};
+  // Bob doesn't document use_skill's parameter name, so try the likely ones, then any value matching a skill.
+  const names = {};
+  for (const s of listSkills()) { names[s.id.toLowerCase()] = s.id; names[s.name.toLowerCase()] = s.id; }
+  let found = ["skill", "skill_name", "skillName", "name"].map((k) => input[k]).find((v) => typeof v === "string" && v.trim());
+  if (!found) found = Object.values(input).find((v) => typeof v === "string" && names[v.trim().toLowerCase()]);
+  if (!found) {
+    fs.appendFileSync(path.join(BOB, "assets", "data", "unmatched.log"), raw + "\n");
+    return null;
+  }
+  return names[found.trim().toLowerCase()] || found.trim();
+}
+
+async function track(id) {
+  if (!id || /[\/]/.test(id)) return;
+  try {
+    await recordUse(id);
+    if (process.stdout.isTTY) console.log(`Recorded 1 use of "${id}" in Firestore`);
+  } catch (err) {
+    logError(err);                                                   // never block Bob
+    if (process.stdout.isTTY) console.error(err.message);
+  }
+}
+
+function log(manual) {
+  if (manual) return track(manual.trim());
   let raw = "";
   process.stdin.setEncoding("utf8");
   process.stdin.on("data", (c) => (raw += c));
   process.stdin.on("end", () => {
-    try {
-      const input = (JSON.parse(raw || "{}").input) || {};
-      // Bob doesn't document use_skill's parameter name, so try the likely ones, then any value matching a skill.
-      const names = {};
-      for (const s of listSkills()) { names[s.id.toLowerCase()] = s.id; names[s.name.toLowerCase()] = s.id; }
-      let found = ["skill", "skill_name", "skillName", "name"].map((k) => input[k]).find((v) => typeof v === "string" && v.trim());
-      if (!found) found = Object.values(input).find((v) => typeof v === "string" && names[v.trim().toLowerCase()]);
-      if (!found) {
-        fs.appendFileSync(path.join(BOB, "assets", "data", "unmatched.log"), raw + "\n");
-        return;
-      }
-      const id = names[found.trim().toLowerCase()] || found.trim();
-      let usage = {};
-      try { usage = JSON.parse(fs.readFileSync(USAGE_FILE, "utf8")); } catch {}
-      usage[id] = (Number(usage[id]) || 0) + 1;
-      fs.writeFileSync(USAGE_FILE, JSON.stringify(usage, null, 2) + "\n");
-      build();
-    } catch {}                                                        // never block Bob
+    let id = null;
+    try { id = skillFromInput(raw); } catch {}
+    if (id) track(id);
   });
 }
 
 /* ---------- build ---------- */
 function build() {
   // Write only when something changed, so the watcher doesn't react to its own output.
-  let usage = {};
-  try { usage = JSON.parse(fs.readFileSync(USAGE_FILE, "utf8")) || {}; } catch {}
-  const skills = listSkills().map((s) => ({ ...s, count: Number(usage[s.id]) || 0 }));
-  const out = "// Generated from skills-usage.json and the SKILL.md files by skills.js - do not edit\n" +
+  const skills = listSkills();
+  const out = "// Generated from the SKILL.md files by skills.js - do not edit. Usage counts live in Firestore.\n" +
     "window.BOB_SKILLS = " + JSON.stringify(skills) + ";\n";
   let old = "";
   try { old = fs.readFileSync(DATA_FILE, "utf8"); } catch {}
@@ -139,7 +188,7 @@ function watch() {
       watched.set(dir, w);
     } catch {}
   };
-  const watchAll = () => { SKILL_DIRS.forEach(watchDir); watchDir(path.dirname(USAGE_FILE)); };
+  const watchAll = () => { SKILL_DIRS.forEach(watchDir); };
   watchAll();
   setInterval(() => { watchAll(); rebuild(); }, 30000);             // pick up a skills/ folder created later; safety rebuild
   build();
@@ -154,7 +203,7 @@ function start() {
 }
 
 const cmd = process.argv[2];
-if (cmd === "log") log();
+if (cmd === "log") log(process.argv[3]);
 else if (cmd === "start") start();
 else if (cmd === "watch") watch();
 else {

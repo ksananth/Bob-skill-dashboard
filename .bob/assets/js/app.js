@@ -1,8 +1,9 @@
 (() => {
   "use strict";
 
-  // Data: assets/data/skills-data.js (written by the Bob hook from skills-usage.json + each SKILL.md).
+  // Skill list: assets/data/skills-data.js (built from each SKILL.md by the Bob hook).
   // Loaded as a <script> so it works when index.html is simply double-clicked.
+  // Usage: Firestore collection "skills" -> { count, lastUsedAt }, pushed here live by onSnapshot.
   const DATA_URL = "assets/data/skills-data.js";
   const POLL_MS = 3000;
 
@@ -10,7 +11,11 @@
   const DEFAULTS = { q: "", cat: "", tag: "", usage: "all", key: "count", dir: "desc" };
   const state = { ...DEFAULTS };
   const PALETTE = ["#4f46e5", "#0ea5e9", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6"];
-  let skills = [];
+  let base = [];            // skills from skills-data.js
+  let usage = {};           // id -> { count, lastUsed (ms, 0 = never) } from Firestore
+  let live = "connecting";  // connecting | live | off | error
+  let liveError = "";
+  let skills = [];          // base + usage, what the screens show
   let catColor = {};
   let lastSnapshot = "";
 
@@ -23,6 +28,16 @@
     return safe.replace(re, "<mark>$1</mark>");
   };
   const plural = (n) => (n === 1 ? "use" : "uses");
+  const ago = (ms) => {
+    if (!ms) return "never";
+    const s = Math.max(0, (Date.now() - ms) / 1000);
+    if (s < 60) return "just now";
+    if (s < 3600) return Math.floor(s / 60) + " min ago";
+    if (s < 86400) return Math.floor(s / 3600) + " h ago";
+    if (s < 86400 * 30) return Math.floor(s / 86400) + " d ago";
+    return new Date(ms).toLocaleDateString();
+  };
+  const fullDate = (ms) => (ms ? new Date(ms).toLocaleString() : "Never");
 
   /* ---------- theme ---------- */
   try { const t = localStorage.getItem("bob-theme"); if (t) document.documentElement.dataset.theme = t; } catch {}
@@ -52,20 +67,54 @@
     const snapshot = JSON.stringify(data);
     if (snapshot === lastSnapshot) return;                     // nothing changed since last check
     lastSnapshot = snapshot;
+    base = data.map((s) => ({ ...s, tags: s.tags || [] }));
+    $("empty").querySelector("p").textContent = "No skills match these filters.";
+    $("reset").hidden = false;
+    refresh();
+  }
 
-    skills = data.map((s) => ({ ...s, tags: s.tags || [], count: Number(s.count) || 0 }));
+  // Merge the skill list with the live Firestore numbers and redraw.
+  function refresh() {
+    if (!lastSnapshot) return;                                 // skill list not loaded yet
+    skills = base.map((s) => ({ ...s, count: usage[s.id]?.count || 0, lastUsed: usage[s.id]?.lastUsed || 0 }));
     catColor = {};
     [...new Set(skills.map((s) => s.category))].sort().forEach((c, i) => (catColor[c] = PALETTE[i % PALETTE.length]));
     if (state.cat && !catColor[state.cat]) state.cat = "";
-    $("source").textContent = `${skills.length} skills · counts from skills-usage.json`;
-    $("empty").querySelector("p").textContent = "No skills match these filters.";
-    $("reset").hidden = false;
+    const status = {
+      connecting: "connecting to Firestore…",
+      live: "live counts from Firestore",
+      off: "Firestore not set up: fill in assets/data/firebase-config.js",
+      error: "Firestore error: " + liveError,
+    }[live];
+    $("source").textContent = `${skills.length} skills · ${status}`;
+    $("source").title = status;
     renderFilters();
     render();
     route();
   }
 
+  function connectFirestore() {
+    const cfg = window.BOB_FIREBASE;
+    if (!window.firebase || !cfg || !cfg.apiKey || !cfg.projectId || /^YOUR_/.test(cfg.apiKey + cfg.projectId)) {
+      live = "off"; refresh(); return;
+    }
+    try {
+      firebase.initializeApp(cfg).firestore().collection("skills").onSnapshot((snap) => {
+        const next = {};
+        snap.forEach((d) => {
+          const x = d.data({ serverTimestamps: "estimate" });
+          next[d.id] = { count: Number(x.count) || 0, lastUsed: x.lastUsedAt && x.lastUsedAt.toMillis ? x.lastUsedAt.toMillis() : 0 };
+        });
+        usage = next; live = "live"; refresh();
+      }, (err) => { live = "error"; liveError = err.message; refresh(); });
+    } catch (err) {
+      live = "error"; liveError = err.message; refresh();
+    }
+  }
+
   async function start() {
+    connectFirestore();
+    setInterval(() => { if (!document.hidden && live === "live") render(); }, 60000);   // keep "x min ago" fresh
     try {
       await load();
     } catch {
@@ -152,6 +201,7 @@
         <div class="usage">
           <div class="top"><span class="count${s.count ? "" : " zero"}">${s.count}</span><span class="unit">${plural(s.count)}</span></div>
           <div class="bar"><i style="width:${((s.count / max) * 100).toFixed(1)}%"></i></div>
+          <span class="last" title="${esc(fullDate(s.lastUsed))}">${s.lastUsed ? "Last used " + ago(s.lastUsed) : "Never used"}</span>
         </div>
         <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
       </li>`).join("");
@@ -289,6 +339,7 @@
             <dl>
               <div><dt>Rank</dt><dd>#${rank} of ${skills.length}</dd></div>
               <div><dt>Share of all uses</dt><dd>${share}%</dd></div>
+              <div><dt>Last used</dt><dd title="${esc(fullDate(s.lastUsed))}">${s.lastUsed ? ago(s.lastUsed) : "Never"}</dd></div>
             </dl>
           </div>
         </aside>
@@ -314,7 +365,7 @@
   $("usage").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) { state.usage = b.dataset.val; render(); } });
   $("sort").addEventListener("change", (e) => {
     state.key = e.target.value;
-    state.dir = state.key === "count" ? "desc" : "asc";
+    state.dir = state.key === "count" || state.key === "lastUsed" ? "desc" : "asc";
     render();
   });
   $("dir").addEventListener("click", () => { state.dir = state.dir === "asc" ? "desc" : "asc"; render(); });
