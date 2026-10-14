@@ -5,10 +5,41 @@ Dashboard of Bob skills with live usage counts and last-used time, stored in Fir
 ## Setup (once)
 
 1. **Firebase config:** fill in `apiKey` and `projectId` in `.bob/assets/data/skills-firebase-db-config.js` (from Firebase Console → Project settings → Your apps → Web app). Then run `git update-index --skip-worktree .bob/assets/data/skills-firebase-db-config.js` once, so your key is never committed.
-2. **Security rules:** paste `firestore.rules` into Firestore → Rules → Publish. They only allow "+1 to count, last used = now", so nobody can set fake numbers.
+2. **Security rules:** in Firebase Console → Firestore Database → **Rules**, replace everything with the rules below (also in `firestore.rules`) and click **Publish**. Without them, Firestore blocks every write with `403 Missing or insufficient permissions`.
 3. **Test:** `node .bob/assets/tools/track-skill-usage.js compose-screen` should print "Recorded 1 use", and the dashboard updates instantly.
 
 Needs Node 18+ (uses built-in `fetch`, nothing to `npm install`).
+
+## Firestore security rules
+
+```
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /skills/{skill} {
+      allow read: if true;
+      allow create: if request.resource.data.keys().hasOnly(['count', 'lastUsedAt'])
+                    && request.resource.data.count == 1
+                    && request.resource.data.lastUsedAt == request.time;
+      allow update: if request.resource.data.keys().hasOnly(['count', 'lastUsedAt'])
+                    && request.resource.data.count == resource.data.count + 1
+                    && request.resource.data.lastUsedAt == request.time;
+      allow delete: if false;
+    }
+  }
+}
+```
+
+What they allow, for each document `skills/<skill-folder>`:
+
+| Action | Allowed? | Rule |
+|---|---|---|
+| **Read** | Anyone | The dashboard can show the counts. |
+| **Create** (first use of a skill) | Only if it starts at 1 | Only the fields `count` and `lastUsedAt`; `count` must be `1`; `lastUsedAt` must be the server's time. |
+| **Update** (every next use) | Only +1 | `count` must be exactly the old value + 1; `lastUsedAt` must be the server's time; no other fields. |
+| **Delete** | No one | Counts can't be wiped from the app. Delete a document by hand in the Firebase console to reset a skill. |
+
+So the public `apiKey` is safe: anyone who has it can still only add 1 use at a time with the real time. They can't set a fake count (for example 999), backdate `lastUsedAt`, add other fields, or delete data.
 
 ## Opening the dashboard
 
@@ -16,6 +47,7 @@ Double-click `.bob/index.html` in **Chrome or Edge**. The first time, click **Ch
 
 ## How it works
 
-- Bob's `PostToolUse` hook on `use_skill` runs `track-skill-usage.js`, which adds 1 to `skills/<skill-name>.count` and sets `lastUsedAt` in Firestore.
+- Bob's `PostToolUse` hook on `use_skill` runs `track-skill-usage.js`, which adds 1 to `skills/<skill-folder>.count` and sets `lastUsedAt` in Firestore.
+- Counts are saved under the skill's **folder name**. Changing the `name:` line in a SKILL.md keeps the same count; renaming the folder starts a new one.
 - `index.html` reads every `SKILL.md` directly each time it opens (and every few seconds), and gets the counts live from Firestore. Nothing is generated, so there's nothing to commit when skills change.
 - If a write fails, Bob is never blocked; the reason goes to `.bob/assets/data/firestore-errors.log`.
